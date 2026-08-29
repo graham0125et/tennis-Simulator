@@ -1,0 +1,98 @@
+﻿# 🎾 Shot System Notes
+
+This file documents the architecture, solvers, shot types, and tuning values for the tennis shot system.
+
+---
+
+## 1. System Overview
+
+- DragTrajectorySolver → RK4 physics simulation
+- DragShotSolver → angle/speed search
+- DragBallistics → drag + gravity constants
+- AimingController → target point (reticle)
+- PreviewArcGenerator → visual trajectory preview
+- SwipeMouseBall → gesture + shot intent
+- HitController → builds final launch velocity
+
+---
+
+## 2. Shot Types (Intent Layer)
+
+### Fast Shot
+- speedMultiplier: 1.15
+- angleOffset: -2°
+- solver: fixed speed → solve angle
+
+### Slow Shot
+- speedMultiplier: 0.85
+- angleOffset: +6°
+- solver: fixed angle → solve speed
+
+### Topspin
+- angleOffset: +3°
+- spin: +1.0
+
+### Slice
+- angleOffset: -3°
+- spin: -1.0
+
+### Lob
+- angleOffset: +20°
+- solver: fixed high angle → solve speed
+
+---
+
+## 3. Solver Helpers
+
+### SolveForReticle (normal shot)
+Free angle + free speed.
+
+### SolveForReticleWithFixedSpeed (fast shot)
+Fixed speed → search angle.
+
+### SolveForReticleWithFixedAngle (slow shot)
+Fixed angle → solve speed.
+
+---
+
+## 4. RK4 Physics Notes
+
+- Drag force: `a_drag = -k * |v| * v`
+- Gravity: `(0, g)`
+- dt = 0.01
+- maxIterations = 20000
+
+---
+
+## 5. Tuning Values
+
+- minSpeed: 6 m/s
+- maxSpeed: 25 m/s
+- minAngle: 8°
+- maxAngle: 40°
+- netMargin: 0.25 m
+- apexMaxHeight: 200 m
+
+---
+
+## 6. Useful Code Snippets
+
+```csharp
+(v0, theta) = shotSolver.SolveForReticleWithFixedSpeed(
+    startPos, targetX, netX, netHeight, fastSpeed
+);
+```
+
+```csharp
+(v0, theta) = shotSolver.SolveForReticleWithFixedAngle(
+    startPos, targetX, netX, netHeight, slowAngle
+);
+```
+
+---
+
+## 7. Future Ideas
+
+- Add slice curve to lateral aim
+- Add topspin effect to vertical decay
+- Add AI shot selection presets

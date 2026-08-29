@@ -1,0 +1,415 @@
+﻿/// Magnus Effect Spin applied the trajectory model
+Swipe → ShotTypeResolver → ComputeShot → HitController → BallController → MagnusBallistics
+Right now, the pipeline stops at HitController because BallController never receives spin.
+
+
+LAYER INPUT
+   ↓
+Swipe → manualV0
+Shot Type → baseIntent
+Modifier → modIntent
+Hold Angle → holdScale
+Reticle → targetX
+
+   ↓
+AIMING CONTROLLER
+   - Computes preview spin
+   - Calls solver (neutral shot)
+   - Draws preview arc (Magnus RK4)
+
+   ↓
+SHOT COMPUTATION SOLVER
+   1) Neutral solver suggestion
+   2) Apply shot type + modifier
+   3) Apply hold angle
+   4) Final solver correction
+   5) Compute spinVector
+   6) Manual speed blend (last)
+   7) Output ShotResult
+
+   ↓
+HIT CONTROLLER
+   - Converts ShotResult → Rigidbody launch
+   - Applies spinVector to MagnusBallistics
+
+   ↓
+DRAG TRAJECTORY SOLVER (RK4)
+   - drag + Magnus + gravity + spin decay
+   - real ball flight
+
+   ↓
+FINAL SHOT
+   - realistic arc
+   - correct dip/curve
+   - matches preview
+
+   AimingController → passes spin to solver + preview
+   PreviewArcGenerator → Magnus RK4
+   DragShotSolver → spin‑aware
+   DragTrajectorySolver → Magnus physics
+   ShotComputationSolver → correct ordering + spinVector
+   HitController → passes spin to physics
+
+   2. ShotComputationSolver automatically picks it up
+Because ShotComputationSolver already does:
+
+csharp
+angleOffsetDeg = baseIntent.angleOffsetDeg + modIntent.angleOffsetDeg;
+…and baseIntent.angleOffsetDeg now includes HeightAngleAdjustmentDeg,
+the solver automatically uses the new height modifier.
+
+No changes needed.
+
+Your entire physics pipeline is now Magnus‑aware:
+HitController → computes real spin
+ShotComputationSolver → applies spin multipliers
+AimingController → previews the same spin‑aware trajectory
+DragShotSolver → finds feasible spin‑aware trajectories
+DragTrajectorySolver → simulates Magnus lift + curve
+
+consistent across preview, solver, and real ball flight
+using the same spin model everywhere
+producing expressive, realistic tennis shots
+
+****Magnus Ballistics****
+Magnus lift (topspin dip, backspin float)
+Magnus sideways curve (slice, kick serve)
+Spin‑dependent drag (spinning balls slow down faster)
+Spin decay (spin reduces over time)
+3D spin vector support
+---------
+****Trajectory Solver****
+Simulates full flight using:
+Magnus lift + sideways curve
+Spin‑dependent drag
+Spin decay
+3D acceleration internally (while keeping 2D trajectory externally)
+Updated RK4 to include Magnus forces in all four stages
+Updated signatures:
+---------------
+****Shot Solver****
+Uses Speed, angle, spin to find a feasible trajectory, Ensures net clearance, Ensures realistic apex,Returns solver‑recommended speed + angle
+gravity
+quadratic drag
+RK4 integration
+The upgraded solver now includes:
+New features
+Magnus lift + sideways curve
+Spin‑dependent drag
+Spin decay
+3D acceleration internally (while keeping 2D trajectory externally)
+Updated RK4 to include Magnus forces in all four stages
+Updated signatures:
+---------------------
+****Aiming Controller****
+OVERVIEW — WHAT THIS SCRIPT DOES
+AimingController is the high‑level “aim preview brain”.
+        Its responsibilities:
+            • Read the current contact position (racket/ball height)
+            • Read the reticle position (target X)
+            • Ask DragShotSolver for a feasible shot (v0, theta) that:
+                  - lands near the reticle
+                  - clears the net with a margin
+            • Cache solutions so small movements don’t constantly re‑solve
+            • Drive PreviewArcGenerator to draw the predicted trajectory
+            • Expose GetShotParameters() so HitController / ShotComputationSolver
+              can query the last solver result.
+
+        With Magnus enabled, it also:
+            • Computes a preview spin vector based on the current shot type
+              and modifier from HitController
+            • Passes that spin into DragShotSolver so the preview arc matches
+              the spin‑aware trajectory model.
+Along with PreviewArcGenerator
+
+
+****ShotComputationSolver****
+1) BASELINE SOLVER SUGGESTION — NEUTRAL SHOT
+This is the foundation of the entire shot system.
+“If I hit a completely neutral shot — no spin, no multipliers, no custom angle — what speed and angle would land at the reticle?”
+Now that we have a neutral baseline, we apply the player’s chosen shot type. -- Fetches the shot type (e.g., topspin, slice, flat). --
+Fetches the modifier (e.g., aggressive, safe, lob) -- Shot types can make the ball faster/slower.  Modifiers can amplify or reduce that. Shot types can raise/lower the launch angle.
+Modifiers can add more spin.
+3) CUSTOM HOLD ANGLE (scroll wheel)
+This is your custom mechanic where the player can “flatten” the shot.
+4) FINAL SOLVER CORRECTION
+Now that we know:
+shot type, multipliers, custom angle, spin
+We ask the solver:  “Given this finalV0, what θ should I use to hit the target?”
+object r = method.Invoke(aimingController, new object[] { workingV0 });
+Calls AimingController’s special method to recompute θ for this V0.
+finalV0 = vt.Item1;
+finalTheta = vt.Item2;
+5) FALLBACK
+If the solver cannot refine the shot, fallback logic kicks in.
+6) SPIN (correct timing)
+csharp
+result.appliedSpin = spinAmount;
+result.spinVector = new Vector3(0f, 0f, -spinAmount);
+7) WEIGHTED SPEED BLEND (last step)
+csharp
+finalV0 = finalV0 * blend + manualV0 * (1f - blend);
+
+
+DragTrajectorySolver expects a Vector3 spin
+AimingController preview uses a Vector3 spin
+PreviewArcGenerator uses a Vector3 spin
+HitController must launch the ball with a Vector3 spin
+
+
+SolveForReticle(..., Vector3 spin)
+SolveV0ForAngle(..., Vector3 spin)
+ComputeApexHeight(..., Vector3 spin)
+PredictLandingX(..., Vector3 spin)
+RK4StepLocal now:
+accepts ref Vector3 spin
+applies spin decay
+uses MagnusBallistics for drag + Magnus forces
+
+HitController: creates physics modules
+MagnusBallistics: computes Magnus forces
+DragTrajectorySolver: simulates flight
+DragShotSolver: finds feasible shots
+ShotComputationSolver: decides spin amount
+1. New dependency added public MagnusBallistics magnus;      // NEW: spin + Magnus physics
+CHANGED constructor
+csharp
+public DragTrajectorySolver(DragBallistics phys, MagnusBallistics magnus)
+{
+    this.phys = phys;
+    this.magnus = magnus;
+2. Accel() now includes Magnus + spin‑dependent drag
+Drag now depends on spin
+Magnus lift + sideways curve added
+Gravity unchanged
+Acceleration now computed in 3D then reduced to 2D
+3. RK4Step now decays spin and passes spin into Accel
+4. SimulateShot now takes a spin vector
+5. SimulateShot now passes spin into RK4Step
+6. GetHeightAtX updated similarly
+
+🟦 Summary Table — What changed vs what stayed
+Component	          Status	                 Notes
+RK4 structure	      Unchanged	               Still 4‑stage RK4
+Gravity	              Unchanged	               Still phys.gravity
+Drag	              Modified	               Now spin‑dependent
+Magnus lift	          Added                  	ω × v
+Magnus sideways curve	Added	              Same formula
+Spin decay	          Added                 	Exponential
+Solver API	           Mostly unchanged	       Only added spin parameter
+Internal math	      Extended                   	Now 3D internally
+Output	Unchanged	Still                    2D trajectory
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+///NEW SHOT TYPES AND ADDITIONAL REDUCED POWER SYSTEM
+cm measure swipe dpi issue
+Live backswing preview
+
+Frozen backswing → maxAllowedSpeed
+
+Gesture power scaling
+
+Final blended shot speed
+
+
+
+**** Log frame on screen cursor change -- This is a single‑frame measurement taken at the moment the gate passes. ****
+**** Log 2This is the total swipe distance, accumulated across all frames from swipe start → swipe end. ****
+
+What your numbers show about your swipe mechanics
+Each log gives you three key pieces of information:
+
+Distance (cm) — how far the cursor travel on screen -- much easier than mouse unknown dpi movement and sensor issues.
+Duration (s) — how long the forward swing took
+Average speed (cm/s) — on screen cursor movement in dpi scaled cm/s
+
+Why Option B fixes your “no movement but 2.5 cm” problem
+Cursor‑space deltas behave like this:
+If the cursor doesn’t move → delta = 0
+If the sensor jitters → delta = 0
+If you press LMB and the mouse wobbles → often delta = 0
+Only real forward motion → delta > 0
+So the conversion to cm becomes:
+no cursor movement → 0 cm
+real swipe → 10–20 cm
+no more false 1.4–2.5 cm readings
+
+Why cmFromArm is not already in cm
+Because distFromArm.magnitude is in pixels, not cm.
+
+You must convert:
+
+cm
+=
+pixels
+screenDPI
+×
+2.54
+That’s exactly what your line does.
+
+1. Yes it is Tracking cursor movement in screen space
+What each variable actually is
+Input.mousePosition
+This is the cursor’s position in screen pixels.
+It has nothing to do with mouse DPI or sensor counts.
+
+distFromArm = mousePos - swipeArmingPos
+This is the cursor’s movement across the screen, measured in pixels.
+
+Example:
+If the cursor moved 120 pixels to the right, distFromArm.magnitude = 120.
+dpi = Screen.dpi
+This is the monitor’s pixel density, not the mouse’s DPI.
+On your 21.5" 1080p monitor, this is ~102 DPI.
+cmFromArm = (pixels / screenDPI) * 2.54
+This converts:
+pixels → inches (divide by screen DPI)
+inches → cm (multiply by 2.54)
+So cmFromArm is cursor movement converted into real‑world cm.
+
+-------------------------------------------------------------------------------
+// Power scale Management
+Holding for power inside the zone is safe
+No accidental swipes.
+✔ Releasing inside the zone is safe
+Power stays.
+✔ Re‑pressing inside the zone is safe
+Power stays.
+✔ You cannot accidentally add more power
+Because backswingLocked = true after the first release.
+✔ You cannot accidentally reset power
+Because only MMB resets it.
+✔ Swipe window is irrelevant
+Because arming is gesture‑based.
+✔ Forward swipe uses the stored power
+Every time.
+✔ The system is clean, predictable, and expressive
+Exactly what you want.
+
+Full lifecycle (now correct)
+Before the zone
+Hold LMB → backswingScale increases
+Release → power stays stored
+Enter the zone
+Forward swipe becomes armed
+Start forward swipe
+frozenBackswing = backswingScale
+backswingScale = 0
+swipeInProgress = true
+During swipe
+Section 1 is skipped
+Section 6 measures movement
+Swipe ends
+Shot is fired
+Reset:
+frozenBackswing = 0, backswingScale = 0, backswingActive = false
+
+
+ 
+ ----------------------------------------------------------------------------------
+ 
+
+
+CM Movement Based Swipe Measurements
+ 1 // Convert pixels → cm
+  float cmThisFrame = (delta.magnitude / dpi) * 2.54f;
+  float cmPerSecond = cmThisFrame / Mathf.Max(Time.deltaTime, 1e-6f);
+  
+ 2// accumulated distance in cm and time over frametime
+            accumulatedDistance += cmThisFrame;   // true distance in cm
+           MINUS accumulatedTime += Time.deltaTime;
+ 
+  Swipe Metrics - total time, swipe dist in cm and average speed calculation
+  3// Swipe Duration in Seconds
+        float duration = Time.time - swipeStartTime;
+        if (duration <= 0f) duration = 0.001f;
+
+        //Swipe Distance in CM
+        float distance = accumulatedDistance;
+             
+        // Swipe Average Speed in CM per second
+        float avgSpeed = distance / duration;
+ 
+ 
+ Classify Swipe at top
+ // CLASSIFY SWIPE (duration, distance, avg speed → categories)
+    4// ----------------------------------------------------------------------
+    private SwipeClassification ClassifySwipe(
+        float duration,
+        float distance,
+        float avgSpeed
+    )
+    {
+        SwipeClassification c = new SwipeClassification();
+        // short swipe less than 0.1 secs and 5 cm, long swipe more than 0.18 secs and 15cm
+        c.isShort = duration < 0.10f || distance < 5f;
+        c.isLong = duration > 0.18f || distance > 15f;
+
+        // normAvg Range 0 to 100cm, normDist 0 to 20cm, normdur 0.1 to 0.22 sec
+        c.normAvg = Mathf.InverseLerp(0f, 100f, avgSpeed);
+        c.normDist = Mathf.InverseLerp(0f, 20f, distance);
+        c.normDur = Mathf.InverseLerp(0.10f, 0.22f, duration);
+
+        return c;
+    }
+ 
+ 5. // power Calcualtion
+  float baselineCap = 22.35f;   // 50 mph
+        float maxCap = 33.52f;        // 75 mph
+
+        float maxAllowedSpeed = Mathf.Lerp(baselineCap, maxCap, backswingScale);
+        lastSwipeSpeed = Mathf.Lerp(6f, maxAllowedSpeed, gesturePower);
+        
+
+        finalSwipeSpeed = Mathf.Clamp(lastSwipeSpeed, 0f, maxAllowedSpeed);
+        if (debugLogs)
+        {
+            Debug.Log(
+                $"[power] rawSwipe={lastSwipeSpeed:F1} m/s, " +
+                $"maxAllowed={maxAllowedSpeed:F1} m/s, " +
+                $"final={finalSwipeSpeed:F1} m/s"
+            );
+        }
+ 
+ 
+ 
+ 
+ Vector2 mousePos = Input.mousePosition;
+        Vector2 delta = mousePos - lastMousePos;
+
+        float movementPerSecond = delta.magnitude / Mathf.Max(Time.deltaTime, 1e-6f);
+        movementPerSecond = Mathf.Min(movementPerSecond, 2000f);
+        float movement = movementPerSecond * Time.deltaTime;
+
+        lastMousePos = mousePos;
+
+
+///Shot pipeline///
+After this change, your entire shot‑type pipeline is complete
+SwipeMouseBall
+→ detects gesture
+→ computes swipeUp/down
+→ computes shortSwipe
+→ computes speed + aim
+→ calls resolver
+→ sends everything to HitController
+
+ShotTypeResolver
+→ interprets LMB/RMB
+→ interprets swipe direction
+→ interprets short swipe
+→ interprets scroll/shift
+→ outputs shot type + modifier
+
+HitController
+→ receives swipeData + baseType + modifier
+→ applies shot profile
+→ applies solver
+→ builds final trajectory
+→ launches ball
+
+This is a clean, modular, AAA‑style architecture.
+ NEXT STEP 1 — Tune the ShotTypeLibrary values
+Right now your shot profiles are placeholders.
+
