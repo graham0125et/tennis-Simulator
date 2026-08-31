@@ -1292,6 +1292,14 @@ public class TennisAIPlayerController : MonoBehaviour
             movement.sustainedAccelerationFloor,
             Mathf.Clamp01(aiMinimumSustainedAccelerationFloor));
 
+        // Explosive first step for chases: sharper burst, holds longer into the stride.
+        movement.useExplosiveStart = true;
+        movement.firstStepAccelerationMultiplier = Mathf.Max(
+            movement.firstStepAccelerationMultiplier, 4.25f);
+        movement.firstStepSpeedFraction = Mathf.Max(0.38f, movement.firstStepSpeedFraction);
+        movement.firstStepCurveExponent = Mathf.Min(movement.firstStepCurveExponent, 1.8f);
+
+
         if (!HasAIBounds())
             return;
 
@@ -2358,17 +2366,27 @@ public class TennisAIPlayerController : MonoBehaviour
 
                 Vector3 bouncedVelocity;
                 Vector3 bouncedSpin;
-                if (ballController != null && ballController.TryPredictCustomCourtBounce(
-                        velocityAtBounce,
-                        spin,
-                        out bouncedVelocity,
-                        out bouncedSpin))
+                if (ballController != null &&
+                ballController.TryPredictCustomCourtBounce(
+                velocityAtBounce,
+                spin,
+                out bouncedVelocity,
+                out bouncedSpin))
                 {
                     velocity = bouncedVelocity;
                     spin = bouncedSpin;
                 }
                 else
                 {
+                    // Last-resort only. Live court bounce uses BallController custom
+                    // impulse math; this crude retention must not be the normal path.
+                    if (debugLogs || logBounceReplans)
+                    {
+                        Debug.LogWarning(
+                            "[AI BOUNCE PREDICT] Custom bounce unavailable; " +
+                            "using retention fallback. Check BallController.useCustomCourtBounce.");
+                    }
+
                     velocity = velocityAtBounce;
                     velocity.y = -velocity.y * Mathf.Clamp01(bounceVelocityRetentionY);
                     velocity.x *= Mathf.Clamp01(bounceVelocityRetentionXZ);
@@ -2510,9 +2528,23 @@ public class TennisAIPlayerController : MonoBehaviour
                 if (pos.y <= predictionBallRadius && vel.y < 0f)
                 {
                     pos.y = predictionBallRadius;
-                    vel.y = -vel.y * Mathf.Clamp01(bounceVelocityRetentionY);
-                    vel.x *= Mathf.Clamp01(bounceVelocityRetentionXZ);
-                    vel.z *= Mathf.Clamp01(bounceVelocityRetentionXZ);
+                    Vector3 velocityAtBounce = vel;
+                    if (ballController != null &&
+                        ballController.TryPredictCustomCourtBounce(
+                            velocityAtBounce,
+                            spin,
+                            out Vector3 bouncedVelocity,
+                            out Vector3 bouncedSpin))
+                    {
+                        vel = bouncedVelocity;
+                        spin = bouncedSpin;
+                    }
+                    else
+                    {
+                        vel.y = -vel.y * Mathf.Clamp01(bounceVelocityRetentionY);
+                        vel.x *= Mathf.Clamp01(bounceVelocityRetentionXZ);
+                        vel.z *= Mathf.Clamp01(bounceVelocityRetentionXZ);
+                    }
                     bounceCount++;
 
                     if (IsOnOwnSide(pos, 0f))
@@ -3488,22 +3520,32 @@ public class TennisAIPlayerController : MonoBehaviour
         }
 
         float remainingContactTime = currentPlan.worldContactTime > 0f
-            ? Mathf.Max(0f, currentPlan.worldContactTime - Time.time)
-            : Mathf.Max(0f, currentPlan.timeUntilContact);
+    ? Mathf.Max(0f, currentPlan.worldContactTime - Time.time)
+    : Mathf.Max(0f, currentPlan.timeUntilContact);
         float liveRunningArrival = EstimateTimeToReachAtFullSpeed(
             currentPlan.stancePoint,
             0f,
             moveSpeed,
             contactStopDistance);
+
+        Vector3 toStance = currentPlan.stancePoint - transform.position;
+        toStance.y = 0f;
+        float planarDistanceToStance = toStance.magnitude;
+
+        // Sprint unless already close with clear spare time. Lateral chases
+        // must not jog through approachSlowDownDistance.
+        const float sprintDistanceThreshold = 1.35f;
+        bool farFromStance = planarDistanceToStance > sprintDistanceThreshold;
+        bool timeTight = float.IsPositiveInfinity(liveRunningArrival) ||
+            liveRunningArrival + Mathf.Max(0f, fullSpeedPursuitSlack) >= remainingContactTime;
         bool mustSprint = currentPlan.requiresFullSpeed ||
             currentPlan.pursuitMode != PursuitMode.Comfortable ||
-            float.IsPositiveInfinity(liveRunningArrival) ||
-            liveRunningArrival + Mathf.Max(0f, fullSpeedPursuitSlack) >= remainingContactTime;
+            farFromStance ||
+            timeTight;
+
         if (mustSprint)
         {
-            // An urgent intercept must use the real configured top speed. Do
-            // not run it through the generic 2.7 m approach slowdown or the
-            // early planted brake that made 7 m/s plans move at a jog.
+            // Full top speed, no approach slowdown, no early arrival brake.
             MoveToward(
                 ClampToMovementBounds(currentPlan.stancePoint),
                 contactStopDistance,
