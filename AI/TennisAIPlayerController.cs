@@ -3486,7 +3486,23 @@ public class TennisAIPlayerController : MonoBehaviour
             stanceZ -= contactLateralSideSign * Mathf.Max(0f, lateralContactOffset);
         }
 
-        return ClampToMovementBounds(new Vector3(contact.x + offset.x, transform.position.y, stanceZ));
+        float stanceX = contact.x + offset.x;
+
+        // Keep normal rally movement on the baseline (lateral only).
+        // Only step in when the predicted first bounce is clearly short.
+        Vector3 baseline = GetTacticalBaselineReference();
+        float baseDepth = Mathf.Abs(baseline.x - netX);
+        float contactDepth = Mathf.Abs(contact.x - netX);
+        float shortThreshold = Mathf.Max(0.5f, shortBallMinimumDepthInsideBase);
+        bool clearlyShort = contactDepth <= baseDepth - shortThreshold;
+
+        if (!clearlyShort && preferPostBounceContact)
+        {
+            // Same depth as base; only Z (across court) follows the ball.
+            stanceX = baseline.x + offset.x;
+        }
+
+        return ClampToMovementBounds(new Vector3(stanceX, transform.position.y, stanceZ));
     }
 
     private bool CanAuthoritativeZoneReachContact(Vector3 contact, Vector3 stance)
