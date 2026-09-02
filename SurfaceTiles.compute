@@ -1,0 +1,2913 @@
+
+#pragma kernel CSTileHeight
+#pragma kernel CSBuildContinuousSurfaceField
+#pragma kernel CSCollectDoorwaySurfaceDiagnostic
+#pragma kernel CSScanDoorwaySurfaceGaps
+#pragma kernel CSScanDoorwaySurfaceFaces
+
+struct GPUParticle
+{
+    float3 pos;
+    float3 vel;
+    float invMass;
+    float density;
+    int state;
+    float sleepTimer;
+    float2 padding;
+};
+
+struct TileData
+{
+    float3 worldPos;
+    float height;
+    int active;
+    float3 pad;
+    // pad.x = local water bottom Y for main-body sidewalls
+    // pad.y = floor particle count
+    // pad.z = max body particle height (raw, unscaled)
+};
+
+struct SurfaceFieldData
+{
+    float height;
+    float coverage;
+    float2 flow;
+    float thickness;
+    float confidence;
+    float2 pad;
+};
+
+struct BulkWaterCell
+{
+    float surfaceY;
+    float sphBottomY;
+    float supportY;
+    float volume;
+    int activeCount;
+    int bulkCount;
+    int spawnedThisStep;
+    int absorbedThisStep;
+    int activeBandCount;
+    int lowerBandCount;
+    int absorptionCreditMilliTokens;
+};
+
+// Matches Fluid.compute's authoritative primary-volume cell layout.
+struct PrimaryVoxelCell
+{
+    float4 velocityPressure;
+    float4 fillAndFlags;
+};
+
+struct SurfaceVisualBaseDiagnostic
+{
+    float4 baseHeights;
+    float4 steps;
+};
+
+struct SurfaceWaveCell{
+    float4 etaBaseDepthPrevious;
+    float4 momentumContactFlags;
+};
+
+struct PrimaryVoxelFaceFlux
+{
+    float4 lateral;
+    float2 vertical;
+    float2 padding;
+};
+
+struct DoorwaySurfaceDiagnosticData
+{
+    float4 meta;
+    float4 targetCoverage;
+    float4 outputCoverage;
+    float4 heights;
+    float4 wave;
+    float4 topology;
+    float4 identity;
+    float4 frameIdentity;
+    float4 footprintCounts;
+    float4 donorAnyCoverage;
+    float4 donorCompatibleCoverage;
+    float4 donorPreferredCoverage;
+    float4 nearestVisibleCurrent;
+    float4 nearestVisiblePrevious;
+};
+
+struct DoorwaySurfaceGapScanData
+{
+    float4 meta;
+    float4 target;
+    float4 ownCoverage;
+    float4 currentNeighbours;
+    float4 previousNeighbours;
+    float4 topology;
+};
+
+struct DoorwaySurfaceFaceData
+{
+    float4 meta;
+    float4 sourceSurface;
+    float4 targetSurface;
+    float4 heights;
+    float4 coverage;
+    float4 flow;
+    float4 state;
+    float4 topology;
+};
+
+StructuredBuffer<GPUParticle> particles;
+StructuredBuffer<float> particleSurfaceAges;
+StructuredBuffer<int> cellHeads;
+StructuredBuffer<int> nextIndex;
+RWStructuredBuffer<TileData> tiles;
+StructuredBuffer<TileData> previousTiles;
+RWStructuredBuffer<float4> tileFlows;
+StructuredBuffer<SurfaceFieldData> previousSurfaceFields;
+RWStructuredBuffer<SurfaceFieldData> surfaceFields;
+RWStructuredBuffer<SurfaceVisualBaseDiagnostic> surfaceVisualBaseDiagnostics;
+StructuredBuffer<BulkWaterCell> bulkWaterCells;
+StructuredBuffer<PrimaryVoxelCell> primaryVoxelFlowCells;
+StructuredBuffer<uint> primaryVoxelSolidCells;
+StructuredBuffer<SurfaceWaveCell> primarySurfaceWaveCells;
+StructuredBuffer<uint> primaryVoxelFaceOpenCells;
+StructuredBuffer<PrimaryVoxelFaceFlux> primaryVoxelFaceFluxCells;
+StructuredBuffer<SurfaceFieldData> diagnosticSurfaceFields;
+StructuredBuffer<SurfaceFieldData> diagnosticPreviousSurfaceFields;
+RWStructuredBuffer<DoorwaySurfaceDiagnosticData> doorwaySurfaceDiagnostics;
+RWStructuredBuffer<DoorwaySurfaceGapScanData> doorwaySurfaceGapScan;
+RWStructuredBuffer<DoorwaySurfaceFaceData> doorwaySurfaceFaceScan;
+
+int _NumParticles;
+int _GridResolution;
+float _CellSize;
+float _SmoothingRadius;
+float _Blend;
+float _HeightScale;
+float _TileSize;
+float _ActivationThreshold;
+float _FloorSupportDistance;
+float _MainBodyLeaveDistance;
+
+// Single-layer surface controls
+float _SingleLayerVisualDepth; // how far above floor the surface sits on first layer
+float _SingleLayerSurfaceRise; // 0-1 how much it rises as floor fills up
+float _SingleLayerRiseGate; // 0 keeps first layer thin, 1 allows it to rise
+float _MultiLayerHeightThreshold; // min span to be treated as multi-layer
+float _LayerRiseBlendRange; // extra span over which a new layer eases in
+float _LayerRiseSpeed; // max upward surface rise in metres per second
+float _FirstLayerFullParticleCount; // particle count at which floor is "fully covered"
+float _FloorSupportMinParticles;
+float _FloorSupportRatioThreshold;
+float _BlobTileStretchStrength; // stretches the wet footprint along particle flow
+float _BlobTileWobbleStrength; // irregularity on the stretched footprint edge
+float _BlobTileEdgeDeformStrength; // amount of non-circular tile activation
+float _BlobShapeResponse; // lower values make flow/blob form lag over time
+float _BlobShapeLagSeconds; // time constant for blob form lag
+float _TileDeltaTime;
+float _BlobTileMaxSpeed; // speed that maps to full footprint stretch
+float _TileTime;
+float _SurfaceFieldHeightResponse;
+float _SurfaceFieldCoverageRiseResponse;
+float _SurfaceFieldCoverageFallResponse;
+float _SurfaceFieldFlowResponse;
+float _SurfaceFieldMinimumCoverage;
+float _SurfaceFieldAdvectionStrength;
+float _SurfaceFieldMaximumAdvectionCells;
+float _SurfaceFieldMaximumMicrocellAdvancePerFrame;
+float _SurfaceFieldCoverageMaximumSpeed;
+float _SurfaceFieldVoxelMassCorrectionResponse;
+float _SurfaceFieldFlowDrivenFrontStrength;
+float _SurfaceFieldIsolatedSeedResponse;
+float _SurfaceFieldContinuityRepairResponse;
+float _SurfaceFieldVisibleContour;
+float _SurfaceFieldVoxelMassReleaseResponse;
+int _SurfaceFieldSeedFromTarget;
+int _SurfaceFieldAllowIsolatedSeeding;
+int _EnableSurfaceVisualBaseDiagnostic;
+int _UsePrimaryVoxelFlowMap;
+int _UsePrimarySurfaceWaveMap;
+int _PrimaryVoxelFlowLayerCount;
+int _UseFractionalPrimaryVoxelSurface;
+int _PrimaryVoxelSurfaceSlotCount;
+int _PrimaryVoxelSurfaceMinimumGapLayers;
+float _PrimaryVoxelSurfaceMinimumFill;
+float _PrimaryVoxelSurfaceCoverageFadeFill;
+float _PrimaryVoxelSurfaceLateralBlendRadius;
+int _PrimaryVoxelSurfaceImmediateVerticalFollow;
+float _PrimaryVoxelSurfaceCellHeight;
+float _PrimaryVoxelSurfaceMaximumVerticalSpeed;
+float _PrimaryVoxelSurfaceVisualBaseMaximumVerticalSpeed;
+float _PrimarySurfaceWaveMaxDisplacement;
+float _PrimarySurfaceWaveVisualResponse;
+float _PrimarySurfaceWaveVisualMaximumVerticalSpeed;
+int _UsePrimarySurfaceWaveArtificialRippleLifecycle;
+float _PrimarySurfaceWaveVisualRippleDuration;
+float _PrimarySurfaceWaveVisualRippleMaximumAmplitude;
+float _PrimarySurfaceWaveVisualRippleActivationAmplitude;
+
+float3 _BoundsMin;
+float3 _BoundsMax;
+int _TileCount;
+int _TileCountX;
+int _TileCountZ;
+int _RenderAirborneTiles;
+int _UseBulkHeightmapFootprint;
+int _BulkGridCountX;
+int _BulkGridCountZ;
+int _DoorwaySurfaceDiagnosticX;
+int _DoorwaySurfaceDiagnosticZ;
+int _DoorwaySurfaceDiagnosticRadius;
+
+static const int PARTICLE_ACTIVE = 1;
+
+float PreviousMainBodyNeighborAverage(uint ux, uint uz, float fallbackHeight, out int neighborCount)
+{
+    float sum = 0.0f;
+    neighborCount = 0;
+
+    [unroll]
+    for (int dz = -1; dz <= 1; dz++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int nx = (int) ux + dx;
+            int nz = (int) uz + dz;
+            if (nx < 0 || nz < 0 || nx >= _TileCountX || nz >= _TileCountZ)
+                continue;
+
+            TileData nt = previousTiles[(uint) nx + (uint) nz * (uint) _TileCountX];
+            if (nt.active != 1)
+                continue;
+
+            sum += nt.height;
+            neighborCount++;
+        }
+    }
+
+    return neighborCount > 0 ? sum / (float) neighborCount : fallbackHeight;
+}
+
+float Hash12(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * 0.1031f);
+    p3 += dot(p3, p3.yzx + 33.33f);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float2 Hash22(float2 p)
+{
+    float n = Hash12(p);
+    return float2(n, Hash12(p + 17.17f));
+}
+
+uint TileIndexFromXZ(float2 xz)
+{
+    float sizeX = max(_BoundsMax.x - _BoundsMin.x, 0.0001f);
+    float sizeZ = max(_BoundsMax.z - _BoundsMin.z, 0.0001f);
+    float u = saturate((xz.x - _BoundsMin.x) / sizeX);
+    float v = saturate((xz.y - _BoundsMin.z) / sizeZ);
+    uint tx = (uint) clamp((int) (u * _TileCountX), 0, _TileCountX - 1);
+    uint tz = (uint) clamp((int) (v * _TileCountZ), 0, _TileCountZ - 1);
+    return tx + tz * (uint) _TileCountX;
+}
+
+float4 BlendTileFlow(uint id, float4 targetFlow)
+{
+    return targetFlow;
+}
+
+BulkWaterCell SampleRenderBulkCell(float2 xz)
+{
+    int2 counts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    float2 extent = max(_BoundsMax.xz - _BoundsMin.xz, float2(0.0001f, 0.0001f));
+    float2 uv = saturate((xz - _BoundsMin.xz) / extent);
+    int2 nearestCoord = clamp((int2) floor(uv * (float2) counts), int2(0, 0), counts - 1);
+    int nearestIndex = nearestCoord.x + nearestCoord.y * counts.x;
+    BulkWaterCell result = bulkWaterCells[nearestIndex];
+
+    // Coarse-cell ownership is categorical. A neighbouring wet cell may
+    // smooth height, but it must not manufacture volume in this dry cell.
+    if (_UseBulkHeightmapFootprint == 0 || result.volume <= 0.000001f)
+        return result;
+
+    float2 grid = uv * (float2) counts - 0.5f;
+    int2 c0 = (int2) floor(grid);
+    float2 f = frac(grid);
+    int2 c1 = c0 + 1;
+    c0 = clamp(c0, int2(0, 0), counts - 1);
+    c1 = clamp(c1, int2(0, 0), counts - 1);
+
+    int indices[4] = {
+        c0.x + c0.y * counts.x,
+        c1.x + c0.y * counts.x,
+        c0.x + c1.y * counts.x,
+        c1.x + c1.y * counts.x
+    };
+    float weights[4] = {
+        (1.0f - f.x) * (1.0f - f.y),
+        f.x * (1.0f - f.y),
+        (1.0f - f.x) * f.y,
+        f.x * f.y
+    };
+
+    float supportSum = 0.0f;
+    float weightSum = 0.0f;
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        BulkWaterCell sampleCell = bulkWaterCells[indices[i]];
+        if (sampleCell.volume <= 0.000001f)
+            continue;
+        supportSum += sampleCell.supportY * weights[i];
+        weightSum += weights[i];
+    }
+
+    float sampledSupport = weightSum > 0.000001f
+        ? supportSum / weightSum
+        : result.supportY;
+    sampledSupport = clamp(sampledSupport, _BoundsMin.y, _BoundsMax.y);
+    result.surfaceY = sampledSupport;
+    result.sphBottomY = sampledSupport;
+    result.supportY = sampledSupport;
+    return result;
+}
+
+// The surface renderer is deliberately not another fluid solve.  It samples
+// the current authoritative voxel column entirely on-GPU and uses that
+// horizontal momentum only to animate the visible flow map.
+float2 ResolvePrimaryVoxelFlow(float2 xz, float2 fallbackFlow)
+{
+    if (_UsePrimaryVoxelFlowMap == 0)
+        return fallbackFlow;
+
+    float2 extent = max(_BoundsMax.xz - _BoundsMin.xz, float2(0.0001f, 0.0001f));
+    float2 uv = saturate((xz - _BoundsMin.xz) / extent);
+    int2 counts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    int2 coord = clamp((int2)floor(uv * (float2)counts), int2(0, 0), counts - 1);
+    int column = coord.x + coord.y * counts.x;
+
+    // The highest wet voxel is the visible free surface for the legacy
+    // height-map renderer. Lower deck surfaces will receive their own render
+    // layer in the next pass; this still makes the currently visible skin
+    // faithfully follow its mass authority rather than PBF relaxation noise.
+    for (int layer = _PrimaryVoxelFlowLayerCount - 1; layer >= 0; layer--)
+    {
+        PrimaryVoxelCell cell = primaryVoxelFlowCells[column + layer * counts.x * counts.y];
+        if (cell.fillAndFlags.x > 0.01f)
+        {
+            float2 velocity = cell.velocityPressure.xz;
+            // Very weak numerical momentum should not erase a stable PBF cue.
+            float weight = saturate(length(velocity) * 2.0f);
+            return lerp(fallbackFlow, velocity, weight);
+        }
+    }
+
+    return fallbackFlow;
+}
+
+// Render-only extraction of one physically distinct free surface. Only a
+// solid deck/barrier separates surface instances. Empty voxel layers are air
+// in the same compartment; treating them as a split makes one surface retreat
+// while another fills its place and leaves a one-voxel hole between them.
+bool TryFindPrimaryVoxelRenderSurface(int column, int desiredSurface,
+                                      float minimumFill,
+                                      out int resultLayer,
+                                      out PrimaryVoxelCell resultCell)
+{
+    resultLayer = -1;
+    resultCell.velocityPressure = 0.0f;
+    resultCell.fillAndFlags = 0.0f;
+    int layerCount = max(_PrimaryVoxelFlowLayerCount, 1);
+    int layersPerColumn = max(_BulkGridCountX, 1) * max(_BulkGridCountZ, 1);
+    int found = 0;
+
+    // A render surface belongs to the top of each contiguous wet vertical
+    // stack.  A dry voxel is a real water-volume gap, just like a solid deck:
+    // it starts a new independent surface stack above it.  Do not use a
+    // compartment-wide "already has surface" state here; that loses one of
+    // two water bodies in an otherwise open column and changes local slot
+    // identity at doorway height differences.
+    [loop]
+    for (int layer = 0; layer < layerCount; layer++)
+    {
+        int index = column + layer * layersPerColumn;
+        if (primaryVoxelSolidCells[index] != 0u ||
+            saturate(primaryVoxelFlowCells[index].fillAndFlags.x) < minimumFill)
+            continue;
+
+        int aboveLayer = layer + 1;
+        bool wetAbove = false;
+        if (aboveLayer < layerCount)
+        {
+            int aboveIndex = column + aboveLayer * layersPerColumn;
+            wetAbove = primaryVoxelSolidCells[aboveIndex] == 0u &&
+                saturate(primaryVoxelFlowCells[aboveIndex].fillAndFlags.x) >= minimumFill;
+        }
+        if (wetAbove)
+            continue;
+
+        if (found == desiredSurface)
+        {
+            resultLayer = layer;
+            resultCell = primaryVoxelFlowCells[index];
+            return true;
+        }
+        found++;
+    }
+    return false;
+}
+bool HasWetPrimaryColumnPathForSurface(
+    int column, int startLayer, int endLayer)
+{
+    int firstLayer = min(startLayer, endLayer);
+    int lastLayer = max(startLayer, endLayer);
+    int layerCount = max(_PrimaryVoxelFlowLayerCount, 1);
+    int primaryArea = max(_BulkGridCountX, 1) * max(_BulkGridCountZ, 1);
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    if (firstLayer < 0 || lastLayer >= layerCount)
+        return false;
+    [loop]
+    for (int layer = firstLayer; layer <= lastLayer; layer++)
+    {
+        int index = column + layer * primaryArea;
+        if (primaryVoxelSolidCells[index] != 0u ||
+            saturate(primaryVoxelFlowCells[index].fillAndFlags.x) < minimumFill)
+            return false;
+    }
+    return true;
+}
+
+// A radial contribution may cross one primary-cell edge only when that edge
+// contains an open, wet voxel connection belonging to the requested surface.
+bool AreAdjacentPrimarySurfaceColumnsConnected(
+    int2 fromCoord, int2 toCoord, int desiredSurface)
+{
+    if (all(fromCoord == toCoord))
+        return true;
+    int2 delta = toCoord - fromCoord;
+    if (abs(delta.x) + abs(delta.y) != 1)
+        return false;
+    int2 counts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    if (fromCoord.x < 0 || fromCoord.y < 0 || toCoord.x < 0 || toCoord.y < 0 ||
+        fromCoord.x >= counts.x || fromCoord.y >= counts.y ||
+        toCoord.x >= counts.x || toCoord.y >= counts.y)
+        return false;
+    int fromColumn = fromCoord.x + fromCoord.y * counts.x;
+    int toColumn = toCoord.x + toCoord.y * counts.x;
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    int fromSurfaceLayer;
+    int toSurfaceLayer;
+    PrimaryVoxelCell ignoredFrom;
+    PrimaryVoxelCell ignoredTo;
+    if (!TryFindPrimaryVoxelRenderSurface(
+            fromColumn, desiredSurface, minimumFill,
+            fromSurfaceLayer, ignoredFrom) ||
+        !TryFindPrimaryVoxelRenderSurface(
+            toColumn, desiredSurface, minimumFill,
+            toSurfaceLayer, ignoredTo))
+        return false;
+    uint fromBit = delta.x > 0 ? 1u :
+        (delta.x < 0 ? 2u : (delta.y > 0 ? 4u : 8u));
+    uint toBit = delta.x > 0 ? 2u :
+        (delta.x < 0 ? 1u : (delta.y > 0 ? 8u : 4u));
+    int primaryArea = counts.x * counts.y;
+    int layerCount = max(_PrimaryVoxelFlowLayerCount, 1);
+    [loop]
+    for (int linkLayer = layerCount - 1; linkLayer >= 0; linkLayer--)
+    {
+        int fromIndex = fromColumn + linkLayer * primaryArea;
+        int toIndex = toColumn + linkLayer * primaryArea;
+        if ((primaryVoxelFaceOpenCells[fromIndex] & fromBit) == 0u ||
+            (primaryVoxelFaceOpenCells[toIndex] & toBit) == 0u ||
+            saturate(primaryVoxelFlowCells[fromIndex].fillAndFlags.x) < minimumFill ||
+            saturate(primaryVoxelFlowCells[toIndex].fillAndFlags.x) < minimumFill)
+            continue;
+        if (HasWetPrimaryColumnPathForSurface(
+                fromColumn, fromSurfaceLayer, linkLayer) &&
+            HasWetPrimaryColumnPathForSurface(
+                toColumn, toSurfaceLayer, linkLayer))
+            return true;
+    }
+    return false;
+}
+// A visual leading band may enter the next primary column only through a
+// genuinely open face. It is a render interpolation of existing voxel flow,
+// never a mass transfer or a route through a closed doorway/wall.
+bool IsPrimarySurfaceFrontFaceOpen(int2 fromCoord, int2 direction, int layer)
+{
+    int2 counts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    int2 toCoord = fromCoord + direction;
+    if (fromCoord.x < 0 || fromCoord.y < 0 || toCoord.x < 0 || toCoord.y < 0 ||
+        fromCoord.x >= counts.x || fromCoord.y >= counts.y ||
+        toCoord.x >= counts.x || toCoord.y >= counts.y ||
+        layer < 0 || layer >= max(_PrimaryVoxelFlowLayerCount, 1))
+        return false;
+
+    uint fromBit = direction.x > 0 ? 1u :
+        (direction.x < 0 ? 2u : (direction.y > 0 ? 4u : 8u));
+    uint toBit = direction.x > 0 ? 2u :
+        (direction.x < 0 ? 1u : (direction.y > 0 ? 8u : 4u));
+    int area = counts.x * counts.y;
+    int fromIndex = fromCoord.x + fromCoord.y * counts.x + layer * area;
+    int toIndex = toCoord.x + toCoord.y * counts.x + layer * area;
+    return primaryVoxelSolidCells[fromIndex] == 0u && primaryVoxelSolidCells[toIndex] == 0u &&
+        (primaryVoxelFaceOpenCells[fromIndex] & fromBit) != 0u &&
+        (primaryVoxelFaceOpenCells[toIndex] & toBit) != 0u;
+}
+
+bool TryBuildFractionalPrimaryVoxelSurface(float2 sampleGrid, int desiredSurface,
+                                           out float surfaceY,
+                                           out float coverage,
+                                           out float2 surfaceFlow,
+                                           out bool directColumnSupport,
+                                           out bool enclosedInteriorSupport)
+{
+    surfaceY = _BoundsMin.y;
+    coverage = 0.0f;
+    surfaceFlow = 0.0f;
+    directColumnSupport = false;
+    enclosedInteriorSupport = false;
+    if (_UseFractionalPrimaryVoxelSurface == 0 ||
+        desiredSurface < 0 || desiredSurface >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+        return false;
+    int2 counts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    if (sampleGrid.x < -0.5f || sampleGrid.y < -0.5f ||
+        sampleGrid.x > (float)counts.x - 0.5f ||
+        sampleGrid.y > (float)counts.y - 0.5f)
+        return false;
+
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    float radius = clamp(_PrimaryVoxelSurfaceLateralBlendRadius, 0.5f, 2.0f);
+    int2 nearestColumn = (int2)floor(sampleGrid + 0.5f);
+
+    // Choose the nearest wet column as the local height/deck anchor. The
+    // surface-map point itself is deliberately not snapped to this column:
+    // every wet voxel will contribute a circular influence in the second pass.
+    bool foundAnchor = false;
+    float anchorDistanceSq = radius * radius + 1.0f;
+    float anchorHeight = _BoundsMin.y;
+    if (nearestColumn.x >= 0 && nearestColumn.y >= 0 &&
+        nearestColumn.x < counts.x && nearestColumn.y < counts.y)
+    {
+        int nearestLayer;
+        PrimaryVoxelCell nearestCell;
+        if (TryFindPrimaryVoxelRenderSurface(
+                nearestColumn.x + nearestColumn.y * counts.x,
+                desiredSurface, minimumFill, nearestLayer, nearestCell))
+        {
+            float2 nearestDelta = (float2)nearestColumn - sampleGrid;
+            anchorDistanceSq = dot(nearestDelta, nearestDelta);
+            anchorHeight = _BoundsMin.y + ((float)nearestLayer +
+                saturate(nearestCell.fillAndFlags.x)) *
+                max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+            foundAnchor = true;
+            directColumnSupport = true;
+        }
+    }
+    // Interior points take the fast path above. Only points outside a wet
+    // voxel search the local neighbourhood for the circle that reaches them.
+    if (!foundAnchor)
+    {
+        [loop]
+        for (int anchorDz = -2; anchorDz <= 2; anchorDz++)
+        {
+            [loop]
+            for (int anchorDx = -2; anchorDx <= 2; anchorDx++)
+            {
+                int2 coord = nearestColumn + int2(anchorDx, anchorDz);
+                if (coord.x < 0 || coord.y < 0 || coord.x >= counts.x || coord.y >= counts.y)
+                    continue;
+
+                float2 delta = (float2)coord - sampleGrid;
+                float distanceSq = dot(delta, delta);
+                if (distanceSq >= radius * radius || distanceSq >= anchorDistanceSq)
+                    continue;
+
+                int layer;
+                PrimaryVoxelCell cell;
+                if (!TryFindPrimaryVoxelRenderSurface(coord.x + coord.y * counts.x,
+                                                      desiredSurface, minimumFill,
+                                                      layer, cell))
+                    continue;
+
+                anchorDistanceSq = distanceSq;
+                anchorHeight = _BoundsMin.y + ((float)layer +
+                    saturate(cell.fillAndFlags.x)) *
+                    max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+                foundAnchor = true;
+            }
+        }
+    }
+    if (!foundAnchor)
+        return false;
+
+    float verticalBand = max(_PrimaryVoxelSurfaceCellHeight * 1.5f, 0.05f);
+    // A circular influence is still the correct outline at a genuine front,
+    // but it must not punch checkerboard holes through the middle of one
+    // authoritative same-slot body.  Four height-compatible cardinal
+    // neighbours prove that the nearest wet column is enclosed rather than
+    // advancing into dry space.  Circle-only support outside a wet nearest
+    // column can never pass this test.
+    if (directColumnSupport)
+    {
+        int compatibleCardinalCount = 0;
+        int2 cardinalOffsets[4] = {
+            int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1)
+        };
+        [unroll]
+        for (int direction = 0; direction < 4; direction++)
+        {
+            int2 neighbourCoord = nearestColumn + cardinalOffsets[direction];
+            if (neighbourCoord.x < 0 || neighbourCoord.y < 0 ||
+                neighbourCoord.x >= counts.x || neighbourCoord.y >= counts.y)
+                continue;
+
+            int neighbourLayer;
+            PrimaryVoxelCell neighbourCell;
+            if (!TryFindPrimaryVoxelRenderSurface(
+                    neighbourCoord.x + neighbourCoord.y * counts.x,
+                    desiredSurface, minimumFill, neighbourLayer, neighbourCell))
+                continue;
+
+            float neighbourHeight = _BoundsMin.y + ((float)neighbourLayer +
+                saturate(neighbourCell.fillAndFlags.x)) *
+                max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+            if (abs(neighbourHeight - anchorHeight) <= verticalBand)
+                compatibleCardinalCount++;
+        }
+        enclosedInteriorSupport = compatibleCardinalCount == 4;
+    }
+
+    float heightSum = 0.0f;
+    float2 flowSum = 0.0f;
+    float wetWeight = 0.0f;
+    float dryProduct = 1.0f;
+    [loop]
+    for (int dz = -2; dz <= 2; dz++)
+    {
+        [loop]
+        for (int dx = -2; dx <= 2; dx++)
+        {
+            int2 coord = nearestColumn + int2(dx, dz);
+            if (coord.x < 0 || coord.y < 0 || coord.x >= counts.x || coord.y >= counts.y)
+                continue;
+
+            int layer;
+            PrimaryVoxelCell cell;
+            if (!TryFindPrimaryVoxelRenderSurface(coord.x + coord.y * counts.x, desiredSurface,
+                                                  minimumFill, layer, cell))
+                continue;
+
+            // Union the anchored voxel footprint with a small copy advanced by
+            // the current voxel flow. This makes the front enter its next open
+            // voxel continuously at flow speed rather than in coarse jumps.
+            float2 baseDelta = (float2)coord - sampleGrid;
+            float2 cellWorldSize = max((_BoundsMax.xz - _BoundsMin.xz) /
+                max((float2)counts, float2(1.0f, 1.0f)), float2(0.0001f, 0.0001f));
+            float2 flowAdvance = cell.velocityPressure.xz / cellWorldSize *
+                max(_TileDeltaTime, 0.0001f);
+            float advanceLength = length(flowAdvance);
+            if (advanceLength > 0.0001f)
+            {
+                flowAdvance *= min(advanceLength, 0.45f) / advanceLength;
+                int2 faceDirection = abs(flowAdvance.x) >= abs(flowAdvance.y)
+                    ? int2(flowAdvance.x >= 0.0f ? 1 : -1, 0)
+                    : int2(0, flowAdvance.y >= 0.0f ? 1 : -1);
+                if (!IsPrimarySurfaceFrontFaceOpen(coord, faceDirection, layer))
+                    flowAdvance = 0.0f;
+            }
+            float distance = min(length(baseDelta),
+                length((float2)coord + flowAdvance - sampleGrid));
+            if (distance >= radius)
+                continue;
+
+            float fill = saturate(cell.fillAndFlags.x);
+            float height = _BoundsMin.y + ((float)layer + fill) *
+                max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+            // Height differences make a slope, not a separate sheet. Only a
+            // real dry/solid break or closed primary face can stop this radial
+            // contribution at a cell boundary.
+            if (abs(height - anchorHeight) > verticalBand &&
+                !AreAdjacentPrimarySurfaceColumnsConnected(
+                    nearestColumn, coord, desiredSurface))
+                continue;
+
+            // A smooth radial basis is the hidden microcircle. Unioning the
+            // influences fills the body interior, while an exposed voxel edge
+            // remains round instead of expanding as an axis-aligned square.
+            float radial = 1.0f - smoothstep(0.0f, radius, distance);
+            float fillProgress = smoothstep(
+                minimumFill,
+                min(minimumFill + max(_PrimaryVoxelSurfaceCoverageFadeFill, 0.0001f), 1.0f),
+                fill);
+            // Even a just-wet top voxel owns a small, rounded footprint.
+            // Overlapping footprints join across an open wet face; they do
+            // not reveal a rectangular coarse cell or wait for flow history.
+            // A newly wet voxel starts as a small radial source and grows with its
+            // authoritative fill; it no longer exposes most of a coarse cell at once.
+            float coverageOnset = fill >= minimumFill
+                ? lerp(0.48f, 1.0f, fillProgress)
+                : 0.0f;
+            float sourceStrength = radial * coverageOnset * lerp(0.80f, 1.0f, fill);
+            float weight = max(sourceStrength, 0.000001f);
+            wetWeight += weight;
+            heightSum += height * weight;
+            flowSum += cell.velocityPressure.xz * weight;
+            dryProduct *= 1.0f - saturate(sourceStrength);
+        }
+    }
+    if (wetWeight <= 0.0001f)
+        return false;
+    surfaceY = clamp(heightSum / wetWeight, _BoundsMin.y, _BoundsMax.y);
+    coverage = saturate(1.0f - dryProduct);
+    surfaceFlow = flowSum / wetWeight;
+    return true;
+}
+
+bool TrySamplePrimarySurfaceWave(float2 sampleGrid, int surfaceSlot,
+                                 float baseSurfaceHeight, out float waveEta)
+{
+    waveEta = 0.0f;
+    if (_UsePrimarySurfaceWaveMap == 0 || surfaceSlot < 0 ||
+        surfaceSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+        return false;
+
+    int countX = max(_BulkGridCountX, 1);
+    int countZ = max(_BulkGridCountZ, 1);
+    int2 cell0 = (int2)floor(sampleGrid);
+    float2 blend = frac(sampleGrid);
+    float etaSum = 0.0f;
+    float weightSum = 0.0f;
+    float compatibilityBand = max(_PrimaryVoxelSurfaceCellHeight * 1.5f, 0.05f);
+
+    [unroll]
+    for (int cornerZ = 0; cornerZ <= 1; cornerZ++)
+    {
+        [unroll]
+        for (int cornerX = 0; cornerX <= 1; cornerX++)
+        {
+            int2 coord = cell0 + int2(cornerX, cornerZ);
+            if (coord.x < 0 || coord.y < 0 || coord.x >= countX || coord.y >= countZ)
+                continue;
+            float2 cornerWeight = float2(
+                cornerX != 0 ? blend.x : 1.0f - blend.x,
+                cornerZ != 0 ? blend.y : 1.0f - blend.y);
+            float weight = cornerWeight.x * cornerWeight.y;
+            int waveIndex = coord.x + coord.y * countX +
+                surfaceSlot * countX * countZ;
+            SurfaceWaveCell wave = primarySurfaceWaveCells[waveIndex];
+            if (wave.momentumContactFlags.w <= 0.5f ||
+                abs(wave.etaBaseDepthPrevious.y - baseSurfaceHeight) > compatibilityBand)
+                continue;
+            etaSum += clamp(wave.etaBaseDepthPrevious.x,
+                -_PrimarySurfaceWaveMaxDisplacement,
+                _PrimarySurfaceWaveMaxDisplacement) * weight;
+            weightSum += weight;
+        }
+    }
+
+    if (weightSum <= 0.0001f)
+        return false;
+    waveEta = etaSum / weightSum;
+    return true;
+}
+
+[numthreads(256, 1, 1)]
+void CSTileHeight(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint) _TileCount)
+        return;
+
+    TileData td = previousTiles[id];
+
+    uint ux = id % (uint) _TileCountX;
+    uint uz = id / (uint) _TileCountX;
+
+    float u = ((float) ux + 0.5f) / (float) _TileCountX;
+    float v = ((float) uz + 0.5f) / (float) _TileCountZ;
+
+    float3 tileCenter;
+    tileCenter.x = lerp(_BoundsMin.x, _BoundsMax.x, u);
+    tileCenter.z = lerp(_BoundsMin.z, _BoundsMax.z, v);
+    tileCenter.y = td.height;
+
+    BulkWaterCell bulkCell = SampleRenderBulkCell(tileCenter.xz);
+    bool hasBulkFootprint = _UseBulkHeightmapFootprint != 0
+                         && bulkCell.volume > 0.0f
+                         && bulkCell.supportY > _BoundsMin.y;
+    float bulkSurfaceY = clamp(bulkCell.supportY, _BoundsMin.y, _BoundsMax.y);
+    float bulkBandBottomY = bulkSurfaceY;
+
+    // XZ search radius = half tile + smoothing radius. The cell lookup uses
+    // the widest possible stretched footprint so flow-shaped blobs can add
+    // tiles outside the old circular radius.
+    float influenceRadius = (_TileSize * 0.5f) + _SmoothingRadius;
+    float h2 = influenceRadius * influenceRadius;
+    float maxBlobSpeed = max(_BlobTileMaxSpeed, 0.0001f);
+    float blobStretchStrength = saturate(_BlobTileStretchStrength);
+    float blobWobbleStrength = saturate(_BlobTileWobbleStrength);
+    float blobEdgeDeformStrength = saturate(_BlobTileEdgeDeformStrength);
+    float searchRadius = influenceRadius * (1.0f + blobStretchStrength * 1.4f);
+
+    float minX = tileCenter.x - searchRadius;
+    float maxX = tileCenter.x + searchRadius;
+    float minZ = tileCenter.z - searchRadius;
+    float maxZ = tileCenter.z + searchRadius;
+
+    int minCX = clamp((int) ((minX - _BoundsMin.x) / _CellSize), 0, _GridResolution - 1);
+    int maxCX = clamp((int) ((maxX - _BoundsMin.x) / _CellSize), 0, _GridResolution - 1);
+    int minCZ = clamp((int) ((minZ - _BoundsMin.z) / _CellSize), 0, _GridResolution - 1);
+    int maxCZ = clamp((int) ((maxZ - _BoundsMin.z) / _CellSize), 0, _GridResolution - 1);
+
+    // Accumulators
+    float allWeightSum = 0.0f;
+    float allWeightedHeightSum = 0.0f;
+    float2 allWeightedFlowSum = 0.0f;
+    float allMinParticleY = _BoundsMax.y + 1000.0f;
+    float allMaxParticleY = _BoundsMin.y - 1000.0f;
+    float bodyWeightSum = 0.0f;
+    float bodyWeightedHeightSum = 0.0f;
+    float2 bodyWeightedFlowSum = 0.0f;
+    float bodyMinParticleY = _BoundsMax.y + 1000.0f;
+    float bodyMaxParticleY = _BoundsMin.y - 1000.0f;
+    float bodyFloorWeightSum = 0.0f;
+    float bodyFloorCount = 0.0f;
+    float bodySupportCount = 0.0f;
+    int found = 0;
+    int bodyFound = 0;
+    float floorJoinY = _BoundsMin.y + _FloorSupportDistance;
+
+    // Full Y column sweep - finds particles at any depth
+    [loop]
+    for (int cy = 0; cy < _GridResolution; cy++)
+    {
+        [loop]
+        for (int cz = minCZ; cz <= maxCZ; cz++)
+        {
+            [loop]
+            for (int cx = minCX; cx <= maxCX; cx++)
+            {
+                int cellIndex = cx
+                              + cy * _GridResolution
+                              + cz * _GridResolution * _GridResolution;
+
+                int j = cellHeads[cellIndex];
+                [loop]
+                while (j != -1)
+                {
+                    GPUParticle p = particles[j];
+                    if (p.state != PARTICLE_ACTIVE)
+                    {
+                        j = nextIndex[j];
+                        continue;
+                    }
+                    // XZ distance only. Use a flow-stretched ellipse instead
+                    // of a circle so droplets and exposed edges can actually
+                    // change footprint, not just soften inside square tiles.
+                    float2 dxz = float2(p.pos.x - tileCenter.x,
+                                        p.pos.z - tileCenter.z);
+
+                    float2 flow = p.vel.xz;
+                    float flowSpeed = length(flow);
+                    float speed01 = saturate(flowSpeed / maxBlobSpeed);
+                    float2 flowDir = flowSpeed > 0.0001f ? flow / flowSpeed : float2(0.7071f, 0.7071f);
+                    float2 flowSide = float2(-flowDir.y, flowDir.x);
+
+                    float along = dot(dxz, flowDir);
+                    float across = dot(dxz, flowSide);
+                    float alongScale = 1.0f + blobStretchStrength * lerp(0.25f, 1.4f, speed01);
+                    float acrossScale = max(0.5f, 1.0f - blobStretchStrength * 0.35f);
+                    float normalizedDistanceSq =
+                        (along * along) / max(h2 * alongScale * alongScale, 0.0001f) +
+                        (across * across) / max(h2 * acrossScale * acrossScale, 0.0001f);
+                    float normalizedDistance = sqrt(normalizedDistanceSq);
+                    float angle = atan2(across / acrossScale, along / alongScale);
+                    float particleSeed = Hash12(tileCenter.xz * 0.37f + flowDir * 1.91f);
+                    float lobeNoise =
+                        sin(angle * 3.0f + particleSeed * 6.2831853f) * 0.55f +
+                        cos(angle * 5.0f - particleSeed * 9.17f) * 0.3f +
+                        sin(angle * 7.0f + particleSeed * 4.61f) * 0.15f;
+                    float edgeIrregularity = lobeNoise * (0.08f + blobWobbleStrength * blobEdgeDeformStrength * 0.26f);
+                    float edgeRadius = max(0.62f, 1.0f + edgeIrregularity);
+
+                    if (normalizedDistance <= edgeRadius)
+                    {
+                        float q = normalizedDistance / edgeRadius;
+                        float t = 1.0f - saturate(q);
+                        float w = t * t;
+
+                        allWeightSum += w;
+                        allWeightedHeightSum += p.pos.y * w;
+                        allWeightedFlowSum += p.vel.xz * w;
+                        allMinParticleY = min(allMinParticleY, p.pos.y);
+                        allMaxParticleY = max(allMaxParticleY, p.pos.y);
+
+                        // Heightmap body rule:
+                        // - particles near the floor always form the first water sheet
+                        // - particles above that only join if they are close enough to
+                        //   already-found body particles in this tile column
+                        // This lets stacked water raise the level but rejects isolated
+                        // airborne spray so it cannot create vertical cylinders.
+                        bool nearFloor = p.pos.y <= floorJoinY;
+                        bool supportedByBulk = hasBulkFootprint
+                                            && p.pos.y >= bulkBandBottomY - _SmoothingRadius * 0.5f
+                                            && p.pos.y <= bulkSurfaceY + _SmoothingRadius;
+                        bool closeToColumnBody = bodyFound > 0
+                                              && p.pos.y <= bodyMaxParticleY + _MainBodyLeaveDistance;
+                        bool bodyCandidate = nearFloor || supportedByBulk || closeToColumnBody;
+
+                        if (bodyCandidate)
+                        {
+                            bodyWeightSum += w;
+                            bodyWeightedHeightSum += p.pos.y * w;
+                            bodyWeightedFlowSum += p.vel.xz * w;
+                            bodyMinParticleY = min(bodyMinParticleY, p.pos.y);
+                            bodyMaxParticleY = max(bodyMaxParticleY, p.pos.y);
+                            bodyFound++;
+
+                            if (nearFloor || supportedByBulk)
+                            {
+                                bodyFloorWeightSum += w;
+                                bodyFloorCount += 1.0f;
+                            }
+
+                            if (nearFloor || supportedByBulk)
+                                bodySupportCount += 1.0f;
+                        }
+
+                        found++;
+                    }
+
+                    j = nextIndex[j];
+                }
+            }
+        }
+    }
+
+    if (bodyFound == 0 && !hasBulkFootprint && found >= (int) max(_FirstLayerFullParticleCount, 1.0f))
+    {
+        bodyWeightSum = allWeightSum;
+        bodyWeightedHeightSum = allWeightedHeightSum;
+        bodyWeightedFlowSum = allWeightedFlowSum;
+        bodyMinParticleY = allMinParticleY;
+        bodyMaxParticleY = allMaxParticleY;
+        bodyFound = found;
+    }
+
+    if (bodyFound > 0 && allWeightSum > _ActivationThreshold)
+    {
+        // ------------------------------------------------------------------
+        // Decide main-body surface height.
+        // Use only body particles here. Do not replace these values with the
+        // all-particle values, otherwise one airborne particle above this tile
+        // pulls the main water surface into a tall cylinder.
+        // ------------------------------------------------------------------
+
+        int bodyNeighborCount = 0;
+        float previous3x3Height = PreviousMainBodyNeighborAverage(
+            ux, uz, _BoundsMin.y + _SingleLayerVisualDepth, bodyNeighborCount);
+
+        float layerSpan = bodyMaxParticleY - bodyMinParticleY;
+        float averageBodyY = bodyWeightedHeightSum / max(bodyWeightSum, 0.0001f);
+        float particleTopOffset = _SmoothingRadius * 0.5f;
+        float columnTopHeight = bodyMaxParticleY + particleTopOffset;
+
+        // Single layer on floor:
+        // Start at minParticleY + SingleLayerVisualDepth so water looks thin
+        // but not invisible. As more particles cover the floor, rise toward
+        // the particle shell.
+        float supportCoverageCount = hasBulkFootprint
+                                 ? max(bodySupportCount, _FirstLayerFullParticleCount)
+                                 : bodyFloorCount;
+        float floorCoverage = saturate(supportCoverageCount
+                             / max(_FirstLayerFullParticleCount, 1.0f));
+        floorCoverage = floorCoverage * floorCoverage * (3.0f - 2.0f * floorCoverage);
+        floorCoverage *= saturate(_SingleLayerRiseGate);
+
+        float lowSurface = bodyMinParticleY + _SingleLayerVisualDepth;
+        float firstLayerHighSurface = lerp(lowSurface, columnTopHeight, _SingleLayerSurfaceRise);
+        float singleLayerHeight = lerp(lowSurface, firstLayerHighSurface, floorCoverage);
+
+        // Ease from one layer to the next over a vertical band. This avoids
+        // a sudden 50-60 cm jump as soon as the next particle layer appears.
+        float layerBlend = smoothstep(
+            _MultiLayerHeightThreshold,
+            _MultiLayerHeightThreshold + max(_LayerRiseBlendRange, 0.0001f),
+            layerSpan);
+        float targetHeight = lerp(singleLayerHeight, columnTopHeight, layerBlend);
+
+        // Clamp to bounds so surface never goes below floor or above ceiling
+        targetHeight = clamp(targetHeight, _BoundsMin.y, _BoundsMax.y);
+
+        float2 bodyFlow = bodyWeightedFlowSum / max(bodyWeightSum, 0.0001f);
+
+        // 3x3 heightmap stabilizer:
+        // If this tile wants to rise far above its surrounding main body,
+        // draw it as a detached top-only tile instead of a depth column.
+        float sparseBodyLimit = max(_FirstLayerFullParticleCount, 4.0f);
+        bool isolatedHighBody = bodyNeighborCount > 0 &&
+            (float) bodyFound <= sparseBodyLimit &&
+            bodyMaxParticleY > previous3x3Height + max(_SmoothingRadius, _MainBodyLeaveDistance * 0.5f);
+        if (bodyNeighborCount > 0 &&
+            (targetHeight > previous3x3Height + _MainBodyLeaveDistance || isolatedHighBody))
+        {
+            // Treat a narrow high inflow column as a crest/spray tile. The
+            // continuous field will use the bulk support fallback underneath
+            // it, so this classification removes the spike without punching
+            // a physical hole in an occupied column.
+            float spikeHeight = targetHeight;
+            float blendedSpikeHeight = (td.active == 2)
+                                      ? lerp(td.height, spikeHeight, _Blend)
+                                      : spikeHeight;
+            if (abs(td.height - spikeHeight) > max(_MainBodyLeaveDistance * 2.0f, _SmoothingRadius * 4.0f))
+                blendedSpikeHeight = spikeHeight;
+
+            td.active = 2;
+            td.pad.x = 0.0f;
+            td.pad.y = 0.0f;
+            td.pad.z = bodyMaxParticleY;
+            float2 spikeFlow = ResolvePrimaryVoxelFlow(tileCenter.xz, bodyFlow);
+            float4 blendedSpikeFlow = BlendTileFlow(id, float4(spikeFlow, length(spikeFlow), 2.0f));
+            td.worldPos = float3(tileCenter.x, blendedSpikeHeight * _HeightScale, tileCenter.z);
+            td.height = blendedSpikeHeight;
+            tileFlows[id] = blendedSpikeFlow;
+            tiles[id] = td;
+            return;
+        }
+
+        float2 visualBodyFlow = ResolvePrimaryVoxelFlow(tileCenter.xz, bodyFlow);
+        float4 blendedBodyFlow = BlendTileFlow(id, float4(visualBodyFlow, length(visualBodyFlow), 1.0f));
+        float previousBaseHeight = td.height;
+        float targetWithRipple = targetHeight;
+        if (abs(previousBaseHeight - targetHeight) > max(_MainBodyLeaveDistance * 2.0f, _SmoothingRadius * 4.0f))
+            previousBaseHeight = targetHeight;
+        if (td.active == 1 && targetWithRipple > previousBaseHeight)
+            targetWithRipple = min(targetWithRipple, previousBaseHeight + max(_LayerRiseSpeed, 0.0001f) * max(_TileDeltaTime, 0.0001f));
+
+        // Blend toward a centimetre-scale particle-height ripple. The ripple is
+        // part of the target, not an every-frame additive offset, so it cannot
+        // accumulate into tall columns when Blend is very low.
+        float blendedHeight = (td.active != 0)
+                            ? lerp(previousBaseHeight, targetWithRipple, _Blend)
+                            : targetWithRipple;
+        blendedHeight = clamp(blendedHeight, _BoundsMin.y, _BoundsMax.y);
+
+        td.worldPos = float3(tileCenter.x, blendedHeight * _HeightScale, tileCenter.z);
+        td.height = blendedHeight;
+        td.active = 1;
+
+        // Store debug values in pad for Inspector readback
+        float localBottomY = hasBulkFootprint
+                           ? min(bulkBandBottomY, bodyMinParticleY - _SingleLayerVisualDepth)
+                           : bodyMinParticleY - _SingleLayerVisualDepth;
+        td.pad.x = max(_BoundsMin.y, localBottomY); // local water bottom Y
+        td.pad.y = max(bodyFloorCount, hasBulkFootprint ? _FirstLayerFullParticleCount : 0.0f); // support particle count
+        td.pad.z = bodyMaxParticleY; // highest raw main-body particle Y
+
+        tileFlows[id] = blendedBodyFlow;
+    }
+    else if (hasBulkFootprint)
+    {
+        float targetHeight = clamp(bulkSurfaceY, _BoundsMin.y, _BoundsMax.y);
+        float previousBaseHeight = td.height;
+        if (td.active == 0 || previousBaseHeight < _BoundsMin.y - 100.0f || previousBaseHeight > _BoundsMax.y + 100.0f)
+            previousBaseHeight = targetHeight;
+        float blendedHeight = lerp(previousBaseHeight, targetHeight, _Blend);
+        blendedHeight = clamp(blendedHeight, _BoundsMin.y, _BoundsMax.y);
+
+        td.worldPos = float3(tileCenter.x, blendedHeight * _HeightScale, tileCenter.z);
+        td.height = blendedHeight;
+        td.active = 1;
+        td.pad.x = max(_BoundsMin.y, min(bulkBandBottomY, blendedHeight - _SingleLayerVisualDepth));
+        td.pad.y = max(_FloorSupportMinParticles, _FirstLayerFullParticleCount);
+        td.pad.z = blendedHeight;
+
+        float2 visualBulkFlow = ResolvePrimaryVoxelFlow(tileCenter.xz, 0.0f);
+        float4 blendedBulkFlow = BlendTileFlow(id, float4(visualBulkFlow, length(visualBulkFlow), 1.0f));
+        tileFlows[id] = blendedBulkFlow;
+    }
+    else if (found > 0 && allWeightSum > _ActivationThreshold)
+    {
+        // Airborne/unjoined water: render as a shallow blob at the particle
+        // height instead of connecting down to the main body or floor.
+        float2 airborneFlow = allWeightedFlowSum / max(allWeightSum, 0.0001f);
+        float2 visualAirborneFlow = ResolvePrimaryVoxelFlow(tileCenter.xz, airborneFlow);
+        float4 blendedAirborneFlow = BlendTileFlow(id, float4(visualAirborneFlow, length(visualAirborneFlow), 2.0f));
+        float targetHeight = clamp(allMaxParticleY, _BoundsMin.y, _BoundsMax.y);
+        float previousBaseHeight = td.height;
+        float targetWithRipple = targetHeight;
+        if (abs(previousBaseHeight - targetHeight) > max(_MainBodyLeaveDistance * 2.0f, _SmoothingRadius * 4.0f))
+            previousBaseHeight = targetHeight;
+        float blendedHeight = (td.active == 2)
+                            ? lerp(previousBaseHeight, targetWithRipple, _Blend)
+                            : targetWithRipple;
+        blendedHeight = clamp(blendedHeight, _BoundsMin.y, _BoundsMax.y);
+
+        td.worldPos = float3(tileCenter.x, blendedHeight * _HeightScale, tileCenter.z);
+        td.height = blendedHeight;
+        td.active = 2;
+        td.pad.x = 0.0f;
+        td.pad.y = 0.0f;
+        td.pad.z = allMaxParticleY;
+
+        tileFlows[id] = blendedAirborneFlow;
+    }
+    else
+    {
+        // No particles - hide tile far below floor so no visible artifact.
+        float hiddenY = _BoundsMin.y - 1000.0f;
+        td.worldPos = float3(tileCenter.x, hiddenY, tileCenter.z);
+        td.height = hiddenY;
+        td.active = 0;
+        td.pad = 0.0f;
+        tileFlows[id] = 0.0f;
+    }
+
+    tiles[id] = td;
+}
+
+SurfaceFieldData ReadPreviousSurfaceField(int x, int z, int surfaceSlot)
+{
+    x = clamp(x, 0, _TileCountX - 1);
+    z = clamp(z, 0, _TileCountZ - 1);
+    int offset = surfaceSlot * _TileCount;
+    return previousSurfaceFields[offset + x + z * _TileCountX];
+}
+
+SurfaceFieldData ReadBestSameHeightPreviousSurfaceField(
+    int x, int z, int preferredSurfaceSlot,
+    float targetBaseHeight, float compatibilityBand)
+{
+    SurfaceFieldData best = ReadPreviousSurfaceField(
+        x, z, preferredSurfaceSlot);
+    // The local ordinal slot is the local water-volume surface. It may rise
+    // or fall substantially through a doorway, so never discard its history
+    // because its height differs from the current compartment.
+    float bestCoverage = saturate(best.coverage);
+
+    // Ordinal slots are column-local. A lower compartment surface can be slot
+    // zero in one column and slot one beside it when another exposed body
+    // exists below. Hand coverage across that bookkeeping boundary only when
+    // the underlying (wave-free) heights match, preserving true deck gaps.
+    [unroll]
+    for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+    {
+        if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+            break;
+        if (candidateSlot == preferredSurfaceSlot)
+            continue;
+        SurfaceFieldData candidate = ReadPreviousSurfaceField(
+            x, z, candidateSlot);
+        float candidateBaseHeight = candidate.height - candidate.pad.y;
+        float candidateCoverage =
+            abs(candidateBaseHeight - targetBaseHeight) <= compatibilityBand
+                ? saturate(candidate.coverage) : 0.0f;
+        if (candidateCoverage > bestCoverage)
+        {
+            best = candidate;
+            bestCoverage = candidateCoverage;
+        }
+    }
+    return best;
+}
+
+// The visual surface may use several fine cells across one authoritative
+// primary voxel. This test keeps topology repair inside a physically wet,
+// wave-free surface path: dry space, solid columns and unrelated deck heights
+// terminate the search instead of being jumped by a distant visible donor.
+bool IsFineSurfaceCellDirectWetCompatible(
+    int2 tileCoord, float targetBaseHeight, float compatibilityBand)
+{
+    if (tileCoord.x < 0 || tileCoord.y < 0 ||
+        tileCoord.x >= _TileCountX || tileCoord.y >= _TileCountZ)
+        return false;
+
+    int2 primaryCounts = int2(
+        max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    float2 primaryPosition =
+        ((float2)tileCoord + 0.5f) /
+            float2(max(_TileCountX, 1), max(_TileCountZ, 1)) *
+        (float2)primaryCounts;
+    int2 primaryCoord = (int2)floor(primaryPosition);
+    if (primaryCoord.x < 0 || primaryCoord.y < 0 ||
+        primaryCoord.x >= primaryCounts.x ||
+        primaryCoord.y >= primaryCounts.y)
+        return false;
+
+    int column = primaryCoord.x + primaryCoord.y * primaryCounts.x;
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    [loop]
+    for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+    {
+        if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+            break;
+        int layer;
+        PrimaryVoxelCell cell;
+        if (!TryFindPrimaryVoxelRenderSurface(
+                column, candidateSlot, minimumFill, layer, cell))
+            continue;
+        // Filled volume, rather than a surface-height comparison, determines
+        // whether this fine cell can lie on the same connected sheet.
+        return true;
+    }
+    return false;
+}
+
+bool TryGetFineSurfacePrimaryCoord(int2 tileCoord, out int2 primaryCoord)
+{
+    primaryCoord = int2(-1, -1);
+    if (tileCoord.x < 0 || tileCoord.y < 0 ||
+        tileCoord.x >= _TileCountX || tileCoord.y >= _TileCountZ)
+        return false;
+    int2 primaryCounts = int2(
+        max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    float2 primaryPosition =
+        ((float2)tileCoord + 0.5f) /
+            float2(max(_TileCountX, 1), max(_TileCountZ, 1)) *
+        (float2)primaryCounts;
+    primaryCoord = (int2)floor(primaryPosition);
+    return primaryCoord.x >= 0 && primaryCoord.y >= 0 &&
+        primaryCoord.x < primaryCounts.x && primaryCoord.y < primaryCounts.y;
+}
+
+bool TryFindPrimarySurfaceLayerAtHeight(
+    int column, float targetBaseHeight, float compatibilityBand,
+    out int resultLayer)
+{
+    resultLayer = -1;
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    float bestDifference = 1e20f;
+    [loop]
+    for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+    {
+        if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+            break;
+        int candidateLayer;
+        PrimaryVoxelCell candidateCell;
+        if (!TryFindPrimaryVoxelRenderSurface(
+                column, candidateSlot, minimumFill,
+                candidateLayer, candidateCell))
+            continue;
+        float candidateHeight = _BoundsMin.y +
+            ((float)candidateLayer + saturate(candidateCell.fillAndFlags.x)) *
+                max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+        float difference = abs(candidateHeight - targetBaseHeight);
+        if (difference > compatibilityBand || difference >= bestDifference)
+            continue;
+        resultLayer = candidateLayer;
+        bestDifference = difference;
+    }
+    return resultLayer >= 0;
+}
+
+// Fine-grid continuity may cross a primary-column boundary only through the
+// same open lateral face used by the authoritative water solver. Within one
+// primary column no lateral face is crossed.
+bool HasWetPrimaryVoxelColumnPath(int column, int startLayer, int endLayer)
+{
+    int firstLayer = min(startLayer, endLayer);
+    int lastLayer = max(startLayer, endLayer);
+    int layerCount = max(_PrimaryVoxelFlowLayerCount, 1);
+    int primaryArea = max(_BulkGridCountX, 1) * max(_BulkGridCountZ, 1);
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    if (firstLayer < 0 || lastLayer >= layerCount)
+        return false;
+    [loop]
+    for (int layer = firstLayer; layer <= lastLayer; layer++)
+    {
+        int index = column + layer * primaryArea;
+        if (primaryVoxelSolidCells[index] != 0u ||
+            saturate(primaryVoxelFlowCells[index].fillAndFlags.x) < minimumFill)
+            return false;
+    }
+    return true;
+}
+
+// Surface height is deliberately not an ownership test.  A fine sheet may
+// follow a hydraulic doorway from one compartment level to another whenever
+// the underlying filled voxels form one continuous volume.
+bool IsFineSurfaceHydraulicallyConnected(
+    int2 fromTile, int2 toTile, int preferredSurfaceSlot,
+    float targetBaseHeight, float compatibilityBand)
+{
+    int2 fromPrimary;
+    int2 toPrimary;
+    if (!TryGetFineSurfacePrimaryCoord(fromTile, fromPrimary) ||
+        !TryGetFineSurfacePrimaryCoord(toTile, toPrimary))
+        return false;
+    if (all(fromPrimary == toPrimary))
+        return true;
+
+    int2 delta = toPrimary - fromPrimary;
+    if (abs(delta.x) + abs(delta.y) != 1)
+        return false;
+
+    int2 primaryCounts = int2(
+        max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    int fromColumn = fromPrimary.x + fromPrimary.y * primaryCounts.x;
+    int toColumn = toPrimary.x + toPrimary.y * primaryCounts.x;
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    int fromSurfaceLayer;
+    int toSurfaceLayer;
+    PrimaryVoxelCell ignoredFromCell;
+    PrimaryVoxelCell ignoredToCell;
+    if (!TryFindPrimaryVoxelRenderSurface(
+            fromColumn, preferredSurfaceSlot, minimumFill,
+            fromSurfaceLayer, ignoredFromCell) ||
+        !TryFindPrimaryVoxelRenderSurface(
+            toColumn, preferredSurfaceSlot, minimumFill,
+            toSurfaceLayer, ignoredToCell))
+        return false;
+
+    uint fromBit = delta.x > 0 ? 1u :
+        (delta.x < 0 ? 2u : (delta.y > 0 ? 4u : 8u));
+    uint toBit = delta.x > 0 ? 2u :
+        (delta.x < 0 ? 1u : (delta.y > 0 ? 8u : 4u));
+    int primaryArea = primaryCounts.x * primaryCounts.y;
+    int layerCount = max(_PrimaryVoxelFlowLayerCount, 1);
+    [loop]
+    for (int linkLayer = layerCount - 1; linkLayer >= 0; linkLayer--)
+    {
+        int fromIndex = fromColumn + linkLayer * primaryArea;
+        int toIndex = toColumn + linkLayer * primaryArea;
+        if ((primaryVoxelFaceOpenCells[fromIndex] & fromBit) == 0u ||
+            (primaryVoxelFaceOpenCells[toIndex] & toBit) == 0u ||
+            saturate(primaryVoxelFlowCells[fromIndex].fillAndFlags.x) < minimumFill ||
+            saturate(primaryVoxelFlowCells[toIndex].fillAndFlags.x) < minimumFill)
+            continue;
+        if (HasWetPrimaryVoxelColumnPath(
+                fromColumn, fromSurfaceLayer, linkLayer) &&
+            HasWetPrimaryVoxelColumnPath(
+                toColumn, toSurfaceLayer, linkLayer))
+            return true;
+    }
+    return false;
+}
+bool HasVisibleWetSurfaceDonorAlong(
+    int2 origin, int2 direction, int maximumReach,
+    int preferredSurfaceSlot, float targetBaseHeight,
+    float compatibilityBand, float visibleContour)
+{
+    int2 previousCoord = origin;
+    [loop]
+    for (int distance = 1; distance <= 16; distance++)
+    {
+        if (distance > maximumReach)
+            break;
+        int2 candidateCoord = origin + direction * distance;
+        if (!IsFineSurfaceCellDirectWetCompatible(
+                candidateCoord, targetBaseHeight, compatibilityBand) ||
+            !IsFineSurfaceHydraulicallyConnected(
+                previousCoord, candidateCoord, preferredSurfaceSlot,
+                targetBaseHeight, compatibilityBand))
+            break;
+        SurfaceFieldData candidate =
+            ReadBestSameHeightPreviousSurfaceField(
+                candidateCoord.x, candidateCoord.y,
+                preferredSurfaceSlot, targetBaseHeight, compatibilityBand);
+        if (candidate.coverage >= visibleContour)
+            return true;
+        previousCoord = candidateCoord;
+    }
+    return false;
+}
+
+// A newly wet primary voxel can have little or no velocity for the first
+// solver step even though its connected upstream voxel is discharging into it.
+// Use that measured upstream velocity only to choose the fine-grid backtrace;
+// coverage still has to come from the previous fine field and still passes
+// through the same open-face test below.
+bool TryFindIncomingPrimarySurfaceFlow(
+    int2 targetCoord, int preferredSurfaceSlot, out float2 incomingFlow)
+{
+    incomingFlow = 0.0f;
+    int2 counts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    if (targetCoord.x < 0 || targetCoord.y < 0 ||
+        targetCoord.x >= counts.x || targetCoord.y >= counts.y)
+        return false;
+
+    int2 offsets[4] = {
+        int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1)
+    };
+    float bestIncomingSpeed = 0.0001f;
+    [unroll]
+    for (int direction = 0; direction < 4; direction++)
+    {
+        int2 sourceCoord = targetCoord + offsets[direction];
+        if (!AreAdjacentPrimarySurfaceColumnsConnected(
+                sourceCoord, targetCoord, preferredSurfaceSlot))
+            continue;
+
+        int sourceColumn = sourceCoord.x + sourceCoord.y * counts.x;
+        int sourceLayer;
+        PrimaryVoxelCell sourceCell;
+        if (!TryFindPrimaryVoxelRenderSurface(
+                sourceColumn, preferredSurfaceSlot,
+                max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f),
+                sourceLayer, sourceCell))
+            continue;
+
+        float2 flow = sourceCell.velocityPressure.xz;
+        float2 toTarget = (float2)(-offsets[direction]);
+        float incomingSpeed = dot(flow, toTarget);
+        if (incomingSpeed <= bestIncomingSpeed)
+            continue;
+        bestIncomingSpeed = incomingSpeed;
+        incomingFlow = flow;
+    }
+    return bestIncomingSpeed > 0.0001f;
+}
+
+// Coverage-weighted bilinear transport prevents dry points (whose retained
+// height is intentionally arbitrary) from dragging a moving wet edge toward
+// the floor. Every sample remains inside its own deck/surface slot.
+SurfaceFieldData SamplePreviousSurfaceField(float2 gridCoordinate, int surfaceSlot)
+{
+    if (gridCoordinate.x < 0.0f || gridCoordinate.y < 0.0f ||
+        gridCoordinate.x > (float)_TileCountX - 1.0f ||
+        gridCoordinate.y > (float)_TileCountZ - 1.0f)
+    {
+        SurfaceFieldData empty;
+        empty.height = _BoundsMin.y;
+        empty.coverage = 0.0f;
+        empty.flow = 0.0f;
+        empty.thickness = 0.0f;
+        empty.confidence = 0.0f;
+        empty.pad = 0.0f;
+        return empty;
+    }
+
+    float2 clampedCoordinate = clamp(
+        gridCoordinate,
+        float2(0.0f, 0.0f),
+        float2(max((float)_TileCountX - 1.0f, 0.0f),
+               max((float)_TileCountZ - 1.0f, 0.0f)));
+    int2 cell0 = (int2)floor(clampedCoordinate);
+    int2 cell1 = min(cell0 + 1, int2(_TileCountX - 1, _TileCountZ - 1));
+    float2 t = frac(clampedCoordinate);
+    float4 weights = float4(
+        (1.0f - t.x) * (1.0f - t.y),
+        t.x * (1.0f - t.y),
+        (1.0f - t.x) * t.y,
+        t.x * t.y);
+
+    SurfaceFieldData f00 = ReadPreviousSurfaceField(cell0.x, cell0.y, surfaceSlot);
+    SurfaceFieldData f10 = ReadPreviousSurfaceField(cell1.x, cell0.y, surfaceSlot);
+    SurfaceFieldData f01 = ReadPreviousSurfaceField(cell0.x, cell1.y, surfaceSlot);
+    SurfaceFieldData f11 = ReadPreviousSurfaceField(cell1.x, cell1.y, surfaceSlot);
+    float4 coverages = saturate(float4(
+        f00.coverage, f10.coverage, f01.coverage, f11.coverage));
+    float4 wetWeights = weights * coverages;
+    float wetWeight = dot(wetWeights, float4(1.0f, 1.0f, 1.0f, 1.0f));
+
+    SurfaceFieldData output;
+    output.coverage = dot(weights, coverages);
+    if (wetWeight > 0.000001f)
+    {
+        output.height = (f00.height * wetWeights.x + f10.height * wetWeights.y +
+                         f01.height * wetWeights.z + f11.height * wetWeights.w) / wetWeight;
+        output.flow = (f00.flow * wetWeights.x + f10.flow * wetWeights.y +
+                       f01.flow * wetWeights.z + f11.flow * wetWeights.w) / wetWeight;
+        output.thickness = (f00.thickness * wetWeights.x + f10.thickness * wetWeights.y +
+                            f01.thickness * wetWeights.z + f11.thickness * wetWeights.w) / wetWeight;
+        output.confidence = (f00.confidence * wetWeights.x + f10.confidence * wetWeights.y +
+                             f01.confidence * wetWeights.z + f11.confidence * wetWeights.w) / wetWeight;
+        output.pad = (f00.pad * wetWeights.x + f10.pad * wetWeights.y +
+                      f01.pad * wetWeights.z + f11.pad * wetWeights.w) / wetWeight;
+    }
+    else
+    {
+        output = ReadPreviousSurfaceField(
+            (int)floor(clampedCoordinate.x + 0.5f),
+            (int)floor(clampedCoordinate.y + 0.5f), surfaceSlot);
+        output.coverage = 0.0f;
+        output.flow = 0.0f;
+        output.thickness = 0.0f;
+        output.confidence = 0.0f;
+        output.pad = 0.0f;
+    }
+    return output;
+}
+
+// Sample only previous fine coverage that is reachable from this output cell
+// through the currently authoritative wet/open topology. Plain bilinear
+// interpolation is allowed within one primary voxel, but it must not blend a
+// donor across a solid or closed face. The returned value is coverage only;
+// the direct primary surface still owns height, thickness, and the envelope.
+float SamplePreviousSurfaceCoverageConstrained(
+    float2 gridCoordinate, int targetX, int targetZ, int surfaceSlot,
+    float targetBaseHeight, float compatibilityBand)
+{
+    if (gridCoordinate.x < 0.0f || gridCoordinate.y < 0.0f ||
+        gridCoordinate.x > (float)_TileCountX - 1.0f ||
+        gridCoordinate.y > (float)_TileCountZ - 1.0f)
+        return 0.0f;
+
+    int2 targetCoord;
+    if (!TryGetFineSurfacePrimaryCoord(int2(targetX, targetZ), targetCoord))
+        return 0.0f;
+
+    float2 clampedCoordinate = clamp(
+        gridCoordinate,
+        float2(0.0f, 0.0f),
+        float2(max((float)_TileCountX - 1.0f, 0.0f),
+               max((float)_TileCountZ - 1.0f, 0.0f)));
+    int2 cell0 = (int2)floor(clampedCoordinate);
+    int2 cell1 = min(cell0 + 1, int2(_TileCountX - 1, _TileCountZ - 1));
+    float2 t = frac(clampedCoordinate);
+    float4 weights = float4(
+        (1.0f - t.x) * (1.0f - t.y),
+        t.x * (1.0f - t.y),
+        (1.0f - t.x) * t.y,
+        t.x * t.y);
+
+    int2 sourceCoords[4] = {
+        cell0, int2(cell1.x, cell0.y),
+        int2(cell0.x, cell1.y), cell1
+    };
+    float coverageSum = 0.0f;
+    float weightSum = 0.0f;
+    [unroll]
+    for (int corner = 0; corner < 4; corner++)
+    {
+        float weight = weights[corner];
+        if (weight <= 0.000001f)
+            continue;
+        int2 sourceCoord = sourceCoords[corner];
+        int2 sourcePrimaryCoord;
+        if (!TryGetFineSurfacePrimaryCoord(sourceCoord, sourcePrimaryCoord))
+            continue;
+        int2 primaryDelta = sourcePrimaryCoord - targetCoord;
+        bool connected = all(primaryDelta == int2(0, 0));
+        // A bilinear corner can only cross one coarse-cell boundary in this
+        // one-cell backtrace. Check that boundary through the authoritative
+        // open-face path; diagonal coarse jumps are never donors.
+        if (!connected && abs(primaryDelta.x) + abs(primaryDelta.y) == 1)
+        {
+            connected = IsFineSurfaceHydraulicallyConnected(
+                int2(targetX, targetZ), sourceCoord, surfaceSlot,
+                targetBaseHeight, compatibilityBand);
+        }
+        if (!connected)
+            continue;
+
+        SurfaceFieldData source = ReadPreviousSurfaceField(
+            sourceCoord.x, sourceCoord.y, surfaceSlot);
+        coverageSum += saturate(source.coverage) * weight;
+        weightSum += weight;
+    }
+
+    return weightSum > 0.000001f
+        ? saturate(coverageSum / weightSum)
+        : 0.0f;
+}
+
+// A critically damped value has continuous velocity, so a threshold change in
+// the authoritative voxels cannot make the render surface start or stop in one
+// frame. The max speed is a visual safety bound, not a fluid constraint.
+float SmoothDampSurfaceValue(float current, float target,
+                             inout float velocity,
+                             float response, float maximumSpeed,
+                             float deltaTime)
+{
+    if (response <= 0.0001f || deltaTime <= 0.000001f)
+        return current;
+
+    float smoothTime = max(2.0f / response, 0.0001f);
+    float omega = 2.0f / smoothTime;
+    float x = omega * deltaTime;
+    float decay = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+    float originalTarget = target;
+    float change = current - target;
+    float maximumChange = max(maximumSpeed, 0.0001f) * smoothTime;
+    change = clamp(change, -maximumChange, maximumChange);
+    target = current - change;
+    float temporary = (velocity + omega * change) * deltaTime;
+    velocity = (velocity - omega * temporary) * decay;
+    float output = target + (change + temporary) * decay;
+
+    if (((originalTarget - current) > 0.0f) == (output > originalTarget))
+    {
+        output = originalTarget;
+        velocity = 0.0f;
+    }
+    return output;
+}
+
+[numthreads(256, 1, 1)]
+void CSBuildContinuousSurfaceField(uint id : SV_DispatchThreadID)
+{
+    int fieldSlotCount = max(_PrimaryVoxelSurfaceSlotCount, 1);
+    if (id >= (uint) (_TileCount * fieldSlotCount))
+        return;
+
+    int surfaceSlot = (int) id / max(_TileCount, 1);
+    uint tileId = id - (uint)(surfaceSlot * _TileCount);
+    int centerX = (int) (tileId % (uint) _TileCountX);
+    int centerZ = (int) (tileId / (uint) _TileCountX);
+
+    if (_EnableSurfaceVisualBaseDiagnostic != 0)
+    {
+        SurfaceVisualBaseDiagnostic emptyVisualBaseDiagnostic;
+        emptyVisualBaseDiagnostic.baseHeights = 0.0f;
+        emptyVisualBaseDiagnostic.steps = 0.0f;
+        surfaceVisualBaseDiagnostics[id] = emptyVisualBaseDiagnostic;
+    }
+
+    float2 tileXZ = float2(
+        lerp(_BoundsMin.x, _BoundsMax.x, ((float) centerX + 0.5f) / max((float) _TileCountX, 1.0f)),
+        lerp(_BoundsMin.z, _BoundsMax.z, ((float) centerZ + 0.5f) / max((float) _TileCountZ, 1.0f)));
+    BulkWaterCell bulkCell = SampleRenderBulkCell(tileXZ);
+    bool hasBulkSupport = _UseBulkHeightmapFootprint != 0 &&
+        bulkCell.volume > 0.000001f &&
+        bulkCell.supportY > _BoundsMin.y;
+
+    // The render heightmap can be finer than the authoritative primary voxel
+    // grid. Map this render-tile centre back into that grid before looking up
+    // a deck surface; using render indices directly would mark most tiles dry.
+    // Continuous primary-grid coordinates keep the fine render field from
+    // repeating one square value across every point inside a coarse voxel.
+    // Integer coordinates are authoritative voxel centres.
+    float2 primaryGrid = float2(
+        ((float)centerX + 0.5f) / max((float)_TileCountX, 1.0f) *
+            max((float)_BulkGridCountX, 1.0f) - 0.5f,
+        ((float)centerZ + 0.5f) / max((float)_TileCountZ, 1.0f) *
+            max((float)_BulkGridCountZ, 1.0f) - 0.5f);
+    float primarySurfaceHeight;
+    float primarySurfaceCoverage;
+    float2 primarySurfaceFlow;
+    bool directPrimaryColumnSupport;
+    bool enclosedPrimaryInteriorSupport;
+    bool hasPrimarySurface = TryBuildFractionalPrimaryVoxelSurface(
+        primaryGrid, surfaceSlot,
+        primarySurfaceHeight, primarySurfaceCoverage, primarySurfaceFlow,
+        directPrimaryColumnSupport, enclosedPrimaryInteriorSupport);
+    float sampledWaveEta;
+    bool hasPrimaryWave = hasPrimarySurface && TrySamplePrimarySurfaceWave(
+        primaryGrid, surfaceSlot, primarySurfaceHeight, sampledWaveEta);
+
+    // Each primary-volume slot is an independent deck surface. Do not let
+    // the legacy particle/bulk reconstruction merge vertically separate bodies.
+    if (_UseFractionalPrimaryVoxelSurface != 0)
+    {
+        // The authoritative voxel field owns this cell's valid envelope,
+        // height, and topology. Coverage may be transported from fine history
+        // only after that direct ownership test succeeds, so a wet voxel
+        // cannot develop a doorway hole from a neighbour's different height.
+        SurfaceFieldData temporalPrimary = previousSurfaceFields[id];
+        float dtPrimary = max(_TileDeltaTime, 0.0001f);
+        bool usePrimaryTarget = hasPrimarySurface;
+        float targetCoverage = usePrimaryTarget ? primarySurfaceCoverage : 0.0f;
+        float flowAlphaPrimary = 1.0f - exp(
+            -max(_SurfaceFieldFlowResponse, 0.0f) * dtPrimary);
+
+        // The target surface always comes directly from this wet voxel's fill.
+        // Coverage is the sole persistent fine-field quantity; the rendered
+        // base is separately rate-limited so discrete voxel transfers cannot
+        // masquerade as instantaneous wave crests.
+        float targetBaseHeight = usePrimaryTarget
+            ? primarySurfaceHeight : _BoundsMin.y;
+        float visualBaseHeight = targetBaseHeight;
+        bool continuingPrimarySurface = usePrimaryTarget &&
+            temporalPrimary.coverage > 0.0001f;
+        if (continuingPrimarySurface)
+        {
+            // height contains the prior visual base plus pad.y (the displayed
+            // eta), so subtract it to recover this tile's persistent base.
+            float previousVisualBaseHeight = temporalPrimary.height - temporalPrimary.pad.y;
+            float maximumBaseStep = max(
+                _PrimaryVoxelSurfaceVisualBaseMaximumVerticalSpeed, 0.01f) * dtPrimary;
+            visualBaseHeight = previousVisualBaseHeight + clamp(
+                targetBaseHeight - previousVisualBaseHeight,
+                -maximumBaseStep, maximumBaseStep);
+        }
+
+        // Wave elevation is the only moving part of the surface geometry.
+        // Horizontal voxel flow remains available to the wave/splat effects,
+        // but it cannot transport coverage away from its owning voxel.
+        float targetWaveEta = usePrimaryTarget
+            ? (hasPrimaryWave ? sampledWaveEta : 0.0f)
+            : 0.0f;
+        // Broad waves retain their direct conservative motion. A small eta
+        // sample becomes one complete visual ripple: rise, crest and fall.
+        // Further small samples are ignored until that envelope completes.
+        float rippleDuration = max(_PrimarySurfaceWaveVisualRippleDuration, 0.01f);
+        float rippleMaxAmplitude = max(
+            _PrimarySurfaceWaveVisualRippleMaximumAmplitude, 0.001f);
+        float rippleActivation = min(
+            max(_PrimarySurfaceWaveVisualRippleActivationAmplitude, 0.0001f),
+            rippleMaxAmplitude);
+        float targetWaveMagnitude = abs(targetWaveEta);
+        float rippleRemaining = max(temporalPrimary.confidence, 0.0f);
+        float rippleAmplitude = temporalPrimary.pad.x;
+        bool largeWave = targetWaveMagnitude > rippleMaxAmplitude;
+        bool startsSmallRipple = usePrimaryTarget &&
+            targetWaveMagnitude >= rippleActivation && !largeWave;
+        bool continuesRipple = rippleRemaining > 0.0001f;
+        float displayedWaveEta = targetWaveEta;
+        if (_UsePrimarySurfaceWaveArtificialRippleLifecycle != 0 &&
+            !largeWave && (continuesRipple || startsSmallRipple))
+        {
+            if (!continuesRipple)
+            {
+                rippleAmplitude = targetWaveEta;
+                rippleRemaining = rippleDuration;
+            }
+            float elapsed = rippleDuration - rippleRemaining;
+            float envelope = sin(3.14159265f * saturate(elapsed / rippleDuration));
+            displayedWaveEta = rippleAmplitude * envelope;
+            rippleRemaining = max(rippleRemaining - dtPrimary, 0.0f);
+        }
+        else
+        {
+            rippleRemaining = 0.0f;
+            rippleAmplitude = 0.0f;
+        }
+        // η remains the fast, direct wave component. Only the voxel-fill base
+        // receives visual slew limiting.
+        if (_EnableSurfaceVisualBaseDiagnostic != 0)
+        {
+            float previousVisualBaseHeightForDiagnostic = continuingPrimarySurface
+                ? temporalPrimary.height - temporalPrimary.pad.y
+                : targetBaseHeight;
+            SurfaceVisualBaseDiagnostic visualBaseDiagnostic;
+            visualBaseDiagnostic.baseHeights = float4(
+                targetBaseHeight, previousVisualBaseHeightForDiagnostic,
+                visualBaseHeight, displayedWaveEta);
+            visualBaseDiagnostic.steps = float4(
+                targetBaseHeight - previousVisualBaseHeightForDiagnostic,
+                visualBaseHeight - previousVisualBaseHeightForDiagnostic,
+                max(_PrimaryVoxelSurfaceVisualBaseMaximumVerticalSpeed, 0.01f) * dtPrimary,
+                usePrimaryTarget ? 1.0f : 0.0f);
+            surfaceVisualBaseDiagnostics[id] = visualBaseDiagnostic;
+        }
+
+        float smoothedHeight = visualBaseHeight + displayedWaveEta;
+        // The voxel field owns the target envelope, height, and topology. The
+        // fine coverage inside that envelope is transported from its prior
+        // position at the measured voxel-flow speed, so a front crosses a new
+        // coarse voxel continuously instead of appearing as a whole square.
+        float2 targetFlow = usePrimaryTarget ? primarySurfaceFlow : float2(0.0f, 0.0f);
+        float2 transportFlow = targetFlow;
+        // At the instant a primary voxel becomes wet, its own velocity may
+        // still be zero while the connected upstream voxel is carrying the
+        // discharge that caused the fill. Use that donor velocity only for
+        // the fine-field backtrace; the output flow remains voxel-owned.
+        if (usePrimaryTarget && temporalPrimary.coverage <= 0.0001f &&
+            length(targetFlow) <= 0.0001f)
+        {
+            int2 targetPrimaryCoord = (int2)floor(primaryGrid + 0.5f);
+            float2 incomingFlow;
+            if (TryFindIncomingPrimarySurfaceFlow(
+                    targetPrimaryCoord, surfaceSlot, incomingFlow))
+                transportFlow = incomingFlow;
+        }
+        float transportedCoverage = usePrimaryTarget &&
+            _SurfaceFieldSeedFromTarget != 0
+            ? saturate(targetCoverage) : 0.0f;
+        if (usePrimaryTarget && _SurfaceFieldSeedFromTarget == 0)
+        {
+            float2 fineCellWorldSize = float2(
+                (_BoundsMax.x - _BoundsMin.x) / max((float)_TileCountX, 1.0f),
+                (_BoundsMax.z - _BoundsMin.z) / max((float)_TileCountZ, 1.0f));
+            float2 fineFlowCells = transportFlow * dtPrimary /
+                max(fineCellWorldSize, float2(0.0001f, 0.0001f));
+            float fineTravel = length(fineFlowCells) *
+                saturate(_SurfaceFieldAdvectionStrength);
+            float maximumFineAdvance = max(
+                _SurfaceFieldMaximumMicrocellAdvancePerFrame, 0.25f);
+            if (fineTravel > maximumFineAdvance)
+                fineFlowCells *= maximumFineAdvance / fineTravel;
+
+            float2 backtracedCoordinate = float2((float)centerX, (float)centerZ) -
+                fineFlowCells * saturate(_SurfaceFieldAdvectionStrength);
+            float compatibilityBand = max(
+                _PrimaryVoxelSurfaceCellHeight * 1.5f, 0.05f);
+            float advectedCoverage =
+                SamplePreviousSurfaceCoverageConstrained(
+                    backtracedCoordinate, centerX, centerZ, surfaceSlot,
+                    primarySurfaceHeight, compatibilityBand);
+            // The direct/open-face envelope is a hard upper bound. Nothing
+            // transported from history can create a sheet in a dry cell or
+            // carry coverage through a wall or closed doorway face.
+            transportedCoverage = min(saturate(targetCoverage), advectedCoverage);
+
+            // A donor can be farther up the actual flow line than this frame's
+            // backtrace distance. Its presence suppresses isolated seeding;
+            // the donor is then reached naturally by subsequent fine-cell
+            // advection rather than lighting the whole target voxel together.
+            bool hasLateralDonor = advectedCoverage > 0.0001f;
+            float flowLength = length(transportFlow);
+            if (!hasLateralDonor && flowLength > 0.0001f)
+            {
+                float2 flowDirection = transportFlow / flowLength;
+                int2 flowStep = abs(flowDirection.x) >= abs(flowDirection.y)
+                    ? int2(flowDirection.x >= 0.0f ? -1 : 1, 0)
+                    : int2(0, flowDirection.y >= 0.0f ? -1 : 1);
+                int donorReach = clamp((int)ceil(
+                    max(_SurfaceFieldMaximumAdvectionCells, 1.0f)), 1, 16);
+                hasLateralDonor = HasVisibleWetSurfaceDonorAlong(
+                    int2(centerX, centerZ), flowStep, donorReach,
+                    surfaceSlot, primarySurfaceHeight, compatibilityBand,
+                    0.0001f);
+            }
+
+            if (!hasLateralDonor && _SurfaceFieldAllowIsolatedSeeding != 0)
+            {
+                float isolatedSeedStep = max(
+                    _SurfaceFieldIsolatedSeedResponse, 0.0f) * dtPrimary;
+                transportedCoverage = min(
+                    saturate(targetCoverage), isolatedSeedStep);
+            }
+        }
+        float targetThickness = usePrimaryTarget
+            ? max(visualBaseHeight + displayedWaveEta - _BoundsMin.y, 0.0f) : 0.0f;
+        SurfaceFieldData primaryOutput;
+        primaryOutput.height = smoothedHeight;
+        primaryOutput.coverage = transportedCoverage;
+        primaryOutput.flow = lerp(temporalPrimary.flow, targetFlow, flowAlphaPrimary);
+        primaryOutput.thickness = targetThickness;
+        primaryOutput.confidence = rippleRemaining;
+        // pad.x is the display-only wave vertical velocity; pad.y is the
+        // filtered display wave elevation. Neither value owns coverage or the
+        // voxel-fill base height.
+        primaryOutput.pad = float2(rippleAmplitude, displayedWaveEta);
+        if (primaryOutput.coverage <= 0.0001f && targetCoverage <= 0.0001f)
+        {
+            primaryOutput.coverage = 0.0f;
+            primaryOutput.flow = 0.0f;
+            primaryOutput.thickness = 0.0f;
+            primaryOutput.confidence = 0.0f;
+            primaryOutput.pad = 0.0f;
+        }
+        surfaceFields[id] = primaryOutput;
+        return;
+    }
+    if (surfaceSlot > 0)
+    {
+        SurfaceFieldData emptyField = previousSurfaceFields[id];
+        emptyField.coverage = 0.0f;
+        emptyField.flow = 0.0f;
+        emptyField.confidence = 0.0f;
+        surfaceFields[id] = emptyField;
+        return;
+    }
+
+    float totalKernelWeight = 0.0f;
+    float wetKernelWeight = 0.0f;
+    float heightSum = 0.0f;
+    float2 flowSum = 0.0f;
+    float thicknessSum = 0.0f;
+    int currentWetTileCount = 0;
+
+    // A compact Gaussian-like reconstruction converts discrete particle
+    // samples into a continuous field. Detached/airborne cells (active == 2)
+    // are deliberately excluded; the particle renderer owns spray and blobs.
+    [loop]
+    for (int dz = -2; dz <= 2; dz++)
+    {
+        float wz = dz == 0 ? 6.0f : (abs(dz) == 1 ? 4.0f : 1.0f);
+        [loop]
+        for (int dx = -2; dx <= 2; dx++)
+        {
+            float wx = dx == 0 ? 6.0f : (abs(dx) == 1 ? 4.0f : 1.0f);
+            float kernelWeight = wx * wz;
+            totalKernelWeight += kernelWeight;
+
+            int x = centerX + dx;
+            int z = centerZ + dz;
+            if (x < 0 || z < 0 || x >= _TileCountX || z >= _TileCountZ)
+                continue;
+
+            uint sampleId = (uint) x + (uint) z * (uint) _TileCountX;
+            TileData sample = tiles[sampleId];
+            if (sample.active != 1)
+                continue;
+
+            currentWetTileCount++;
+
+            float sourceHeight = clamp(sample.height, _BoundsMin.y, _BoundsMax.y);
+            float sourceBottom = min(sample.pad.x, sourceHeight);
+            wetKernelWeight += kernelWeight;
+            heightSum += sourceHeight * kernelWeight;
+            flowSum += tileFlows[sampleId].xy * kernelWeight;
+            thicknessSum += max(sourceHeight - sourceBottom, 0.0f) * kernelWeight;
+        }
+    }
+
+    SurfaceFieldData previous = previousSurfaceFields[id];
+    float nearbyWetMax = 0.0f;
+    float nearbyWetWeight = 0.0f;
+    float nearbyWetHeightSum = 0.0f;
+    float2 nearbyWetFlowSum = 0.0f;
+    int nearbyWetCount = 0;
+    [loop]
+    for (int ndz = -2; ndz <= 2; ndz++)
+    {
+        [loop]
+        for (int ndx = -2; ndx <= 2; ndx++)
+        {
+            if (ndx == 0 && ndz == 0)
+                continue;
+            int nx = centerX + ndx;
+            int nz = centerZ + ndz;
+            if (nx < 0 || nz < 0 || nx >= _TileCountX || nz >= _TileCountZ)
+                continue;
+
+            SurfaceFieldData neighbour = previousSurfaceFields[nx + nz * _TileCountX];
+            if (neighbour.coverage <= 0.05f)
+                continue;
+
+            float neighbourDistance = length(float2((float) ndx, (float) ndz));
+            float neighbourWeight = 1.0f / max(neighbourDistance, 1.0f);
+            nearbyWetCount++;
+            nearbyWetMax = max(nearbyWetMax, neighbour.coverage);
+            nearbyWetWeight += neighbourWeight;
+            nearbyWetHeightSum += neighbour.height * neighbourWeight;
+            nearbyWetFlowSum += neighbour.flow * neighbourWeight;
+        }
+    }
+
+    float rawCoverage = wetKernelWeight / max(totalKernelWeight, 0.0001f);
+    float minimumCoverage = saturate(_SurfaceFieldMinimumCoverage);
+    float particleCoverage = saturate((rawCoverage - minimumCoverage) /
+                                      max(1.0f - minimumCoverage, 0.0001f));
+    float nearbyHeightForOpening = nearbyWetWeight > 0.0001f
+        ? nearbyWetHeightSum / nearbyWetWeight
+        : previous.height;
+    float lowerOpeningDrop = max(_SmoothingRadius, _TileSize * 2.0f);
+    bool trueLowerOpening = hasBulkSupport && particleCoverage <= 0.05f &&
+        nearbyWetCount >= 3 && nearbyWetWeight > 0.0001f &&
+        bulkCell.surfaceY < nearbyHeightForOpening - lowerOpeningDrop;
+    // A physically occupied bulk column keeps the continuous surface field
+    // connected even when its active surface tiles are temporarily classified
+    // as spray/crest or are being rebuilt after an opening. Bulk support is a
+    // lower-bound sample, so it cannot raise an existing particle surface.
+    bool effectiveBulkSupport = hasBulkSupport && !trueLowerOpening;
+    float bulkCoverage = effectiveBulkSupport ? 1.0f : 0.0f;
+    bool confirmedOuterEdge = !hasBulkSupport && particleCoverage <= 0.05f && nearbyWetCount < 3;
+    // Previous-field neighbours may repair a spray-classified hole, but they
+    // are not allowed to bootstrap water across an otherwise dry domain.
+    // Require a current connected main-body tile in the reconstruction window.
+    float nearbyCoverageFill = (!confirmedOuterEdge && !trueLowerOpening &&
+        currentWetTileCount > 0 && nearbyWetCount >= 3)
+        ? max(nearbyWetMax * 0.92f, 0.35f)
+        : 0.0f;
+    float targetCoverage = max(max(particleCoverage, bulkCoverage), nearbyCoverageFill);
+    bool hasNeighbourSupport = nearbyWetWeight > 0.0001f && nearbyCoverageFill > 0.0f;
+    bool hasWetSupport = wetKernelWeight > 0.0001f || effectiveBulkSupport || hasNeighbourSupport;
+
+    float particleHeight = wetKernelWeight > 0.0001f
+        ? heightSum / wetKernelWeight
+        : previous.height;
+    float nearbyHeight = nearbyHeightForOpening;
+    float targetHeight = hasWetSupport
+        ? (effectiveBulkSupport
+            ? max(particleHeight, bulkCell.supportY)
+            : (wetKernelWeight > 0.0001f ? particleHeight : nearbyHeight))
+        : previous.height;
+    float2 targetFlow = wetKernelWeight > 0.0001f
+        ? flowSum / wetKernelWeight
+        : (hasNeighbourSupport && nearbyWetWeight > 0.0001f
+            ? nearbyWetFlowSum / nearbyWetWeight
+            : float2(0.0f, 0.0f));
+    float particleThickness = wetKernelWeight > 0.0001f
+        ? thicknessSum / wetKernelWeight
+        : previous.thickness;
+    float bulkThickness = effectiveBulkSupport
+        ? max(bulkCell.supportY - _BoundsMin.y, 0.0f)
+        : 0.0f;
+    float targetThickness = effectiveBulkSupport
+        ? max(particleThickness, bulkThickness)
+        : particleThickness;
+
+    // Broad body height comes directly from fractional primary-voxel fill.
+    // The particle layer still supplies detail, but can no longer delay a
+    // rise until the following voxel layer has a full PBF skin.
+    if (hasPrimarySurface)
+    {
+        targetCoverage = max(targetCoverage, primarySurfaceCoverage);
+        targetHeight = primarySurfaceHeight;
+        targetFlow = primarySurfaceFlow;
+        targetThickness = max(primarySurfaceHeight - _BoundsMin.y, 0.0f);
+        hasWetSupport = true;
+    }
+
+    float dt = max(_TileDeltaTime, 0.0001f);
+    float heightAlpha = 1.0f - exp(-max(_SurfaceFieldHeightResponse, 0.0f) * dt);
+    float coverageResponse = targetCoverage >= previous.coverage
+        ? _SurfaceFieldCoverageRiseResponse
+        : _SurfaceFieldCoverageFallResponse;
+    float coverageAlpha = 1.0f - exp(-max(coverageResponse, 0.0f) * dt);
+    float flowAlpha = 1.0f - exp(-max(_SurfaceFieldFlowResponse, 0.0f) * dt);
+
+    // A newly wet point starts at the reconstructed water height while its
+    // coverage fades in. This avoids pulling a visible edge up from the floor.
+    bool newlyWet = previous.coverage <= 0.0001f && targetCoverage > 0.0001f;
+
+    SurfaceFieldData output;
+    output.height = newlyWet
+        ? targetHeight
+        : (hasPrimarySurface && _PrimaryVoxelSurfaceImmediateVerticalFollow != 0
+            ? targetHeight
+            : lerp(previous.height, targetHeight, heightAlpha));
+    output.coverage = lerp(previous.coverage, targetCoverage, coverageAlpha);
+    output.flow = lerp(previous.flow, targetFlow, flowAlpha);
+    output.thickness = newlyWet
+        ? targetThickness
+        : lerp(previous.thickness, targetThickness, heightAlpha);
+    output.confidence = lerp(previous.confidence,
+        max(max(rawCoverage, bulkCoverage), primarySurfaceCoverage), coverageAlpha);
+    // Carry the opening decision to the material so its neighbour fill cannot
+    // immediately paint a lower opening back in as a transparent-hole fix.
+    output.pad = float2(trueLowerOpening ? 1.0f : 0.0f, 0.0f);
+
+    if (output.coverage <= 0.0001f && targetCoverage <= 0.0001f)
+    {
+        output.coverage = 0.0f;
+        output.flow = 0.0f;
+        output.confidence = 0.0f;
+    }
+
+    surfaceFields[id] = output;
+}
+
+SurfaceFieldData ReadDoorwaySurfaceField(int2 primaryCoord, int surfaceSlot)
+{
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    float2 tileCoordinate =
+        ((float2)primaryCoord + 0.5f) / (float2)primaryCounts *
+            float2(max(_TileCountX, 1), max(_TileCountZ, 1)) - 0.5f;
+    int2 tileCoord = clamp(
+        (int2)floor(tileCoordinate + 0.5f),
+        int2(0, 0), int2(_TileCountX - 1, _TileCountZ - 1));
+    int slot = clamp(surfaceSlot, 0, max(_PrimaryVoxelSurfaceSlotCount, 1) - 1);
+    return diagnosticSurfaceFields[
+        slot * _TileCount + tileCoord.x + tileCoord.y * _TileCountX];
+}
+
+SurfaceFieldData ReadDoorwayPreviousSurfaceField(int2 primaryCoord, int surfaceSlot)
+{
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    float2 tileCoordinate =
+        ((float2)primaryCoord + 0.5f) / (float2)primaryCounts *
+            float2(max(_TileCountX, 1), max(_TileCountZ, 1)) - 0.5f;
+    int2 tileCoord = clamp(
+        (int2)floor(tileCoordinate + 0.5f),
+        int2(0, 0), int2(_TileCountX - 1, _TileCountZ - 1));
+    int slot = clamp(surfaceSlot, 0, max(_PrimaryVoxelSurfaceSlotCount, 1) - 1);
+    return diagnosticPreviousSurfaceFields[
+        slot * _TileCount + tileCoord.x + tileCoord.y * _TileCountX];
+}
+
+void ReadDoorwayDominantIdentity(
+    int2 primaryCoord,
+    out float currentSlot, out float currentBaseHeight, out float currentCoverage,
+    out float previousSlot, out float previousBaseHeight, out float previousCoverage)
+{
+    currentSlot = previousSlot = -1.0f;
+    currentBaseHeight = previousBaseHeight = _BoundsMin.y;
+    currentCoverage = previousCoverage = 0.0f;
+    [unroll]
+    for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+    {
+        if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+            break;
+        SurfaceFieldData current = ReadDoorwaySurfaceField(primaryCoord, candidateSlot);
+        float currentCandidateCoverage = saturate(current.coverage);
+        if (currentCandidateCoverage > currentCoverage)
+        {
+            currentSlot = (float)candidateSlot;
+            currentBaseHeight = current.height - current.pad.y;
+            currentCoverage = currentCandidateCoverage;
+        }
+        SurfaceFieldData previous = ReadDoorwayPreviousSurfaceField(primaryCoord, candidateSlot);
+        float previousCandidateCoverage = saturate(previous.coverage);
+        if (previousCandidateCoverage > previousCoverage)
+        {
+            previousSlot = (float)candidateSlot;
+            previousBaseHeight = previous.height - previous.pad.y;
+            previousCoverage = previousCandidateCoverage;
+        }
+    }
+}
+
+void ReadDoorwayPreviousFootprintDonorCoverage(
+    int2 primaryCoord, int preferredSurfaceSlot,
+    float targetBaseHeight, float compatibilityBand,
+    out float anyCoverage, out float compatibleCoverage,
+    out float preferredCoverage)
+{
+    anyCoverage = compatibleCoverage = preferredCoverage = 0.0f;
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    if (primaryCoord.x < 0 || primaryCoord.y < 0 ||
+        primaryCoord.x >= primaryCounts.x || primaryCoord.y >= primaryCounts.y)
+        return;
+    int tileStartX = clamp((int)floor(
+        (float)primaryCoord.x * (float)_TileCountX / (float)primaryCounts.x),
+        0, _TileCountX - 1);
+    int tileEndX = clamp((int)ceil(
+        (float)(primaryCoord.x + 1) * (float)_TileCountX / (float)primaryCounts.x) - 1,
+        tileStartX, _TileCountX - 1);
+    int tileStartZ = clamp((int)floor(
+        (float)primaryCoord.y * (float)_TileCountZ / (float)primaryCounts.y),
+        0, _TileCountZ - 1);
+    int tileEndZ = clamp((int)ceil(
+        (float)(primaryCoord.y + 1) * (float)_TileCountZ / (float)primaryCounts.y) - 1,
+        tileStartZ, _TileCountZ - 1);
+    [loop]
+    for (int tileZ = tileStartZ; tileZ <= tileEndZ; tileZ++)
+    {
+        [loop]
+        for (int tileX = tileStartX; tileX <= tileEndX; tileX++)
+        {
+            [unroll]
+            for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+            {
+                if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+                    break;
+                SurfaceFieldData candidate = diagnosticPreviousSurfaceFields[
+                    candidateSlot * _TileCount + tileX + tileZ * _TileCountX];
+                float coverage = saturate(candidate.coverage);
+                anyCoverage = max(anyCoverage, coverage);
+                if (abs((candidate.height - candidate.pad.y) - targetBaseHeight) <= compatibilityBand)
+                {
+                    compatibleCoverage = max(compatibleCoverage, coverage);
+                    if (candidateSlot == preferredSurfaceSlot)
+                        preferredCoverage = max(preferredCoverage, coverage);
+                }
+            }
+        }
+    }
+}
+
+void ReadDoorwayPreferredFootprintVisibleCoverage(
+    int2 primaryCoord, int preferredSurfaceSlot,
+    float targetBaseHeight, float compatibilityBand, float visibleContour,
+    bool usePreviousFrame, out float maximumCoverage)
+{
+    maximumCoverage = 0.0f;
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    if (primaryCoord.x < 0 || primaryCoord.y < 0 ||
+        primaryCoord.x >= primaryCounts.x || primaryCoord.y >= primaryCounts.y)
+        return;
+    int tileStartX = clamp((int)floor(
+        (float)primaryCoord.x * (float)_TileCountX / (float)primaryCounts.x),
+        0, _TileCountX - 1);
+    int tileEndX = clamp((int)ceil(
+        (float)(primaryCoord.x + 1) * (float)_TileCountX / (float)primaryCounts.x) - 1,
+        tileStartX, _TileCountX - 1);
+    int tileStartZ = clamp((int)floor(
+        (float)primaryCoord.y * (float)_TileCountZ / (float)primaryCounts.y),
+        0, _TileCountZ - 1);
+    int tileEndZ = clamp((int)ceil(
+        (float)(primaryCoord.y + 1) * (float)_TileCountZ / (float)primaryCounts.y) - 1,
+        tileStartZ, _TileCountZ - 1);
+    [loop]
+    for (int tileZ = tileStartZ; tileZ <= tileEndZ; tileZ++)
+    {
+        [loop]
+        for (int tileX = tileStartX; tileX <= tileEndX; tileX++)
+        {
+            int fieldIndex = preferredSurfaceSlot * _TileCount +
+                tileX + tileZ * _TileCountX;
+            SurfaceFieldData candidate;
+            if (usePreviousFrame)
+                candidate = diagnosticPreviousSurfaceFields[fieldIndex];
+            else
+                candidate = diagnosticSurfaceFields[fieldIndex];
+            float coverage = saturate(candidate.coverage);
+            float baseHeight = candidate.height - candidate.pad.y;
+            if (coverage >= visibleContour &&
+                abs(baseHeight - targetBaseHeight) <= compatibilityBand)
+                maximumCoverage = max(maximumCoverage, coverage);
+        }
+    }
+}
+
+void FindNearestDoorwayVisibleCompatibleFootprints(
+    int2 origin, int preferredSurfaceSlot, int directLayer,
+    float targetBaseHeight, float compatibilityBand, float visibleContour,
+    int searchRadius,
+    out float4 nearestCurrent, out float4 nearestPrevious)
+{
+    nearestCurrent = float4(0.0f, 0.0f, -1.0f, 0.0f);
+    nearestPrevious = float4(0.0f, 0.0f, -1.0f, 0.0f);
+    float bestCurrentDistanceSquared = 1e20f;
+    float bestPreviousDistanceSquared = 1e20f;
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    [loop]
+    for (int dz = -searchRadius; dz <= searchRadius; dz++)
+    {
+        [loop]
+        for (int dx = -searchRadius; dx <= searchRadius; dx++)
+        {
+            int distanceSquared = dx * dx + dz * dz;
+            if (distanceSquared == 0 || distanceSquared > searchRadius * searchRadius)
+                continue;
+            int2 candidateCoord = origin + int2(dx, dz);
+            if (candidateCoord.x < 0 || candidateCoord.y < 0 ||
+                candidateCoord.x >= primaryCounts.x || candidateCoord.y >= primaryCounts.y)
+                continue;
+            int candidateColumn = candidateCoord.x + candidateCoord.y * primaryCounts.x;
+            int candidateLayer;
+            PrimaryVoxelCell candidateCell;
+            if (!TryFindPrimaryVoxelRenderSurface(
+                    candidateColumn, preferredSurfaceSlot, minimumFill,
+                    candidateLayer, candidateCell) || candidateLayer != directLayer)
+                continue;
+            float candidateVoxelHeight = _BoundsMin.y +
+                ((float)candidateLayer + saturate(candidateCell.fillAndFlags.x)) *
+                    max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+            if (abs(candidateVoxelHeight - targetBaseHeight) > compatibilityBand)
+                continue;
+            float currentCoverage;
+            ReadDoorwayPreferredFootprintVisibleCoverage(
+                candidateCoord, preferredSurfaceSlot, targetBaseHeight,
+                compatibilityBand, visibleContour, false, currentCoverage);
+            if (currentCoverage >= visibleContour &&
+                ((float)distanceSquared < bestCurrentDistanceSquared ||
+                 ((float)distanceSquared == bestCurrentDistanceSquared &&
+                  currentCoverage > nearestCurrent.w)))
+            {
+                bestCurrentDistanceSquared = (float)distanceSquared;
+                nearestCurrent = float4(
+                    (float)dx, (float)dz, sqrt((float)distanceSquared), currentCoverage);
+            }
+            float previousCoverage;
+            ReadDoorwayPreferredFootprintVisibleCoverage(
+                candidateCoord, preferredSurfaceSlot, targetBaseHeight,
+                compatibilityBand, visibleContour, true, previousCoverage);
+            if (previousCoverage >= visibleContour &&
+                ((float)distanceSquared < bestPreviousDistanceSquared ||
+                 ((float)distanceSquared == bestPreviousDistanceSquared &&
+                  previousCoverage > nearestPrevious.w)))
+            {
+                bestPreviousDistanceSquared = (float)distanceSquared;
+                nearestPrevious = float4(
+                    (float)dx, (float)dz, sqrt((float)distanceSquared), previousCoverage);
+            }
+        }
+    }
+}
+
+SurfaceFieldData ReadBestDoorwaySameHeightField(
+    int2 primaryCoord, int preferredSurfaceSlot,
+    float targetBaseHeight, float compatibilityBand)
+{
+    SurfaceFieldData best = ReadDoorwaySurfaceField(primaryCoord, preferredSurfaceSlot);
+    float bestCoverage =
+        abs((best.height - best.pad.y) - targetBaseHeight) <= compatibilityBand
+            ? saturate(best.coverage) : 0.0f;
+    if (bestCoverage <= 0.0f)
+        best.coverage = 0.0f;
+
+    [unroll]
+    for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+    {
+        if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+            break;
+        if (candidateSlot == preferredSurfaceSlot)
+            continue;
+        SurfaceFieldData candidate = ReadDoorwaySurfaceField(primaryCoord, candidateSlot);
+        float candidateCoverage =
+            abs((candidate.height - candidate.pad.y) - targetBaseHeight) <= compatibilityBand
+                ? saturate(candidate.coverage) : 0.0f;
+        if (candidateCoverage > bestCoverage)
+        {
+            best = candidate;
+            bestCoverage = candidateCoverage;
+        }
+    }
+    return best;
+}
+
+[numthreads(15, 1, 1)]
+void CSCollectDoorwaySurfaceDiagnostic(uint id : SV_DispatchThreadID)
+{
+    if (id >= 15u)
+        return;
+
+    int surfaceSlot = (int)(id % 3u);
+    int sampleIndex = (int)(id / 3u);
+    int radius = clamp(_DoorwaySurfaceDiagnosticRadius, 1, 4);
+    int2 offset = int2(0, 0);
+    if (sampleIndex == 1) offset = int2(radius, 0);
+    else if (sampleIndex == 2) offset = int2(-radius, 0);
+    else if (sampleIndex == 3) offset = int2(0, radius);
+    else if (sampleIndex == 4) offset = int2(0, -radius);
+
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    int2 coord = int2(_DoorwaySurfaceDiagnosticX, _DoorwaySurfaceDiagnosticZ) + offset;
+    DoorwaySurfaceDiagnosticData output;
+    output.meta = float4(-1.0f, -1.0f, (float)surfaceSlot, 0.0f);
+    output.targetCoverage = 0.0f;
+    output.outputCoverage = 0.0f;
+    output.heights = 0.0f;
+    output.wave = float4(0.0f, 0.0f, 0.0f, -1.0f);
+    output.topology = 0.0f;
+    output.identity = float4(-1.0f, -1.0f, -1.0f, 0.0f);
+    output.frameIdentity = 0.0f;
+    output.footprintCounts = 0.0f;
+    output.donorAnyCoverage = 0.0f;
+    output.donorCompatibleCoverage = 0.0f;
+    output.donorPreferredCoverage = 0.0f;
+    output.nearestVisibleCurrent = float4(0.0f, 0.0f, -1.0f, 0.0f);
+    output.nearestVisiblePrevious = float4(0.0f, 0.0f, -1.0f, 0.0f);
+    if (coord.x < 0 || coord.y < 0 ||
+        coord.x >= primaryCounts.x || coord.y >= primaryCounts.y ||
+        surfaceSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+    {
+        doorwaySurfaceDiagnostics[id] = output;
+        return;
+    }
+
+    int primaryArea = primaryCounts.x * primaryCounts.y;
+    int column = coord.x + coord.y * primaryCounts.x;
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    int directLayer;
+    PrimaryVoxelCell directCell;
+    bool hasDirectSurface = TryFindPrimaryVoxelRenderSurface(
+        column, surfaceSlot, minimumFill, directLayer, directCell);
+    float directFill = hasDirectSurface ? saturate(directCell.fillAndFlags.x) : 0.0f;
+
+    float targetHeight;
+    float rawTargetCoverage;
+    float2 targetFlow;
+    bool directColumnSupport;
+    bool enclosedInteriorSupport;
+    bool hasTarget = TryBuildFractionalPrimaryVoxelSurface(
+        (float2)coord, surfaceSlot,
+        targetHeight, rawTargetCoverage, targetFlow,
+        directColumnSupport, enclosedInteriorSupport);
+
+    SurfaceFieldData centerField = ReadDoorwaySurfaceField(coord, surfaceSlot);
+    float currentBaseHeight = centerField.height - centerField.pad.y;
+    float currentDominantSlot;
+    float currentDominantBaseHeight;
+    float currentDominantCoverage;
+    float previousDominantSlot;
+    float previousDominantBaseHeight;
+    float previousDominantCoverage;
+    ReadDoorwayDominantIdentity(
+        coord, currentDominantSlot, currentDominantBaseHeight, currentDominantCoverage,
+        previousDominantSlot, previousDominantBaseHeight, previousDominantCoverage);
+    float compatibilityBand = max(_PrimaryVoxelSurfaceCellHeight * 1.5f, 0.05f);
+    bool heightCompatible = !hasTarget || centerField.coverage <= 0.0001f ||
+        abs(currentBaseHeight - targetHeight) <= compatibilityBand;
+    bool useTarget = hasTarget && heightCompatible;
+    float visibleContour = clamp(_SurfaceFieldVisibleContour, 0.05f, 0.9f);
+    float interiorCoverageFloor = min(max(visibleContour + 0.20f, 0.65f), 0.90f);
+
+    SurfaceFieldData positiveX = ReadBestDoorwaySameHeightField(
+        coord + int2(radius, 0), surfaceSlot, targetHeight, compatibilityBand);
+    SurfaceFieldData negativeX = ReadBestDoorwaySameHeightField(
+        coord + int2(-radius, 0), surfaceSlot, targetHeight, compatibilityBand);
+    SurfaceFieldData positiveZ = ReadBestDoorwaySameHeightField(
+        coord + int2(0, radius), surfaceSlot, targetHeight, compatibilityBand);
+    SurfaceFieldData negativeZ = ReadBestDoorwaySameHeightField(
+        coord + int2(0, -radius), surfaceSlot, targetHeight, compatibilityBand);
+    bool bracketedX = positiveX.coverage >= visibleContour &&
+        negativeX.coverage >= visibleContour;
+    bool bracketedZ = positiveZ.coverage >= visibleContour &&
+        negativeZ.coverage >= visibleContour;
+    float effectiveTargetCoverage = useTarget ? rawTargetCoverage : 0.0f;
+    if (useTarget && (enclosedInteriorSupport ||
+        (directColumnSupport && (bracketedX || bracketedZ))))
+        effectiveTargetCoverage = max(effectiveTargetCoverage, interiorCoverageFloor);
+
+    int wetMask = 0;
+    int solidNeighbourMask = 0;
+    int compatibleCardinalCount = 0;
+    float4 donorAnyCoverage = 0.0f;
+    float4 donorCompatibleCoverage = 0.0f;
+    float4 donorPreferredCoverage = 0.0f;
+    int2 cardinalOffsets[4] = {
+        int2(radius, 0), int2(-radius, 0), int2(0, radius), int2(0, -radius)
+    };
+    [loop]
+    for (int direction = 0; direction < 4; direction++)
+    {
+        int2 neighbour = coord + cardinalOffsets[direction];
+        if (neighbour.x < 0 || neighbour.y < 0 ||
+            neighbour.x >= primaryCounts.x || neighbour.y >= primaryCounts.y)
+            continue;
+        float anyDonorCoverage;
+        float compatibleDonorCoverage;
+        float preferredDonorCoverage;
+        ReadDoorwayPreviousFootprintDonorCoverage(
+            neighbour, surfaceSlot, targetHeight, compatibilityBand,
+            anyDonorCoverage, compatibleDonorCoverage, preferredDonorCoverage);
+        if (direction == 0)
+        {
+            donorAnyCoverage.x = anyDonorCoverage;
+            donorCompatibleCoverage.x = compatibleDonorCoverage;
+            donorPreferredCoverage.x = preferredDonorCoverage;
+        }
+        else if (direction == 1)
+        {
+            donorAnyCoverage.y = anyDonorCoverage;
+            donorCompatibleCoverage.y = compatibleDonorCoverage;
+            donorPreferredCoverage.y = preferredDonorCoverage;
+        }
+        else if (direction == 2)
+        {
+            donorAnyCoverage.z = anyDonorCoverage;
+            donorCompatibleCoverage.z = compatibleDonorCoverage;
+            donorPreferredCoverage.z = preferredDonorCoverage;
+        }
+        else
+        {
+            donorAnyCoverage.w = anyDonorCoverage;
+            donorCompatibleCoverage.w = compatibleDonorCoverage;
+            donorPreferredCoverage.w = preferredDonorCoverage;
+        }
+        int neighbourColumn = neighbour.x + neighbour.y * primaryCounts.x;
+        int neighbourLayer;
+        PrimaryVoxelCell neighbourCell;
+        if (TryFindPrimaryVoxelRenderSurface(
+                neighbourColumn, surfaceSlot, minimumFill,
+                neighbourLayer, neighbourCell))
+        {
+            float neighbourHeight = _BoundsMin.y +
+                ((float)neighbourLayer + saturate(neighbourCell.fillAndFlags.x)) *
+                    max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+            if (!hasTarget || abs(neighbourHeight - targetHeight) <= compatibilityBand)
+            {
+                wetMask |= 1 << direction;
+                compatibleCardinalCount++;
+            }
+        }
+        if (hasDirectSurface && directLayer >= 0 &&
+            primaryVoxelSolidCells[neighbourColumn + directLayer * primaryArea] != 0u)
+            solidNeighbourMask |= 1 << direction;
+    }
+
+    int tileStartX = clamp((int)floor(
+        (float)coord.x * (float)_TileCountX / (float)primaryCounts.x),
+        0, _TileCountX - 1);
+    int tileEndX = clamp((int)ceil(
+        (float)(coord.x + 1) * (float)_TileCountX / (float)primaryCounts.x) - 1,
+        tileStartX, _TileCountX - 1);
+    int tileStartZ = clamp((int)floor(
+        (float)coord.y * (float)_TileCountZ / (float)primaryCounts.y),
+        0, _TileCountZ - 1);
+    int tileEndZ = clamp((int)ceil(
+        (float)(coord.y + 1) * (float)_TileCountZ / (float)primaryCounts.y) - 1,
+        tileStartZ, _TileCountZ - 1);
+    float minimumOutputCoverage = 1.0f;
+    float maximumOutputCoverage = 0.0f;
+    float summedOutputCoverage = 0.0f;
+    int outputSampleCount = 0;
+    int currentNonzeroCount = 0;
+    int currentVisibleCount = 0;
+    int previousNonzeroCount = 0;
+    int previousVisibleCount = 0;
+    [loop]
+    for (int tileZ = tileStartZ; tileZ <= tileEndZ; tileZ++)
+    {
+        [loop]
+        for (int tileX = tileStartX; tileX <= tileEndX; tileX++)
+        {
+            int fieldIndex = surfaceSlot * _TileCount + tileX + tileZ * _TileCountX;
+            float sampleCoverage = saturate(diagnosticSurfaceFields[fieldIndex].coverage);
+            float previousSampleCoverage =
+                saturate(diagnosticPreviousSurfaceFields[fieldIndex].coverage);
+            if (sampleCoverage > 0.0001f) currentNonzeroCount++;
+            if (sampleCoverage >= visibleContour) currentVisibleCount++;
+            if (previousSampleCoverage > 0.0001f) previousNonzeroCount++;
+            if (previousSampleCoverage >= visibleContour) previousVisibleCount++;
+            minimumOutputCoverage = min(minimumOutputCoverage, sampleCoverage);
+            maximumOutputCoverage = max(maximumOutputCoverage, sampleCoverage);
+            summedOutputCoverage += sampleCoverage;
+            outputSampleCount++;
+        }
+    }
+    if (outputSampleCount <= 0)
+        minimumOutputCoverage = maximumOutputCoverage = centerField.coverage;
+    float averageOutputCoverage = outputSampleCount > 0
+        ? summedOutputCoverage / (float)outputSampleCount
+        : centerField.coverage;
+
+    SurfaceWaveCell waveCell;
+    waveCell.etaBaseDepthPrevious = 0.0f;
+    waveCell.momentumContactFlags = float4(0.0f, 0.0f, -1.0f, 0.0f);
+    bool waveValid = false;
+    if (_UsePrimarySurfaceWaveMap != 0)
+    {
+        waveCell = primarySurfaceWaveCells[column + surfaceSlot * primaryArea];
+        waveValid = waveCell.momentumContactFlags.w > 0.5f &&
+            (!hasTarget || abs(waveCell.etaBaseDepthPrevious.y - targetHeight) <= compatibilityBand);
+    }
+
+    uint flags = 0u;
+    if (hasTarget) flags |= 1u;
+    if (directColumnSupport) flags |= 2u;
+    if (enclosedInteriorSupport) flags |= 4u;
+    if (bracketedX) flags |= 8u;
+    if (bracketedZ) flags |= 16u;
+    if (rawTargetCoverage < visibleContour) flags |= 32u;
+    if (centerField.coverage < visibleContour) flags |= 64u;
+    if (minimumOutputCoverage < visibleContour) flags |= 128u;
+    if (waveValid) flags |= 256u;
+    if (heightCompatible) flags |= 512u;
+    if (_SurfaceFieldSeedFromTarget != 0) flags |= 1024u;
+
+    output.meta = float4((float)coord.x, (float)coord.y, (float)surfaceSlot, directFill);
+    output.targetCoverage = float4(
+        rawTargetCoverage, effectiveTargetCoverage, visibleContour, length(targetFlow));
+    output.outputCoverage = float4(
+        saturate(centerField.coverage), minimumOutputCoverage,
+        averageOutputCoverage, maximumOutputCoverage);
+    output.heights = float4(
+        targetHeight, currentBaseHeight,
+        currentBaseHeight - targetHeight, compatibilityBand);
+    output.wave = float4(
+        waveCell.etaBaseDepthPrevious.x,
+        waveCell.etaBaseDepthPrevious.y,
+        waveCell.etaBaseDepthPrevious.z,
+        waveCell.momentumContactFlags.z);
+    output.topology = float4(
+        (float)flags, (float)wetMask,
+        (float)solidNeighbourMask, (float)compatibleCardinalCount);
+    output.identity = float4(
+        hasDirectSurface ? (float)directLayer : -1.0f,
+        currentDominantSlot, previousDominantSlot,
+        currentDominantSlot != previousDominantSlot ? 1.0f : 0.0f);
+    output.frameIdentity = float4(
+        currentDominantBaseHeight, currentDominantCoverage,
+        previousDominantBaseHeight, previousDominantCoverage);
+    output.footprintCounts = float4(
+        (float)currentNonzeroCount, (float)currentVisibleCount,
+        (float)previousNonzeroCount, (float)previousVisibleCount);
+    output.donorAnyCoverage = donorAnyCoverage;
+    output.donorCompatibleCoverage = donorCompatibleCoverage;
+    output.donorPreferredCoverage = donorPreferredCoverage;
+    if (hasTarget && hasDirectSurface)
+    {
+        FindNearestDoorwayVisibleCompatibleFootprints(
+            coord, surfaceSlot, directLayer,
+            targetHeight, compatibilityBand, visibleContour, 12,
+            output.nearestVisibleCurrent, output.nearestVisiblePrevious);
+    }
+    doorwaySurfaceDiagnostics[id] = output;
+}
+
+[numthreads(8, 8, 1)]
+void CSScanDoorwaySurfaceGaps(uint3 id : SV_DispatchThreadID)
+{
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    int surfaceSlot = (int)id.z;
+    if (id.x >= (uint)primaryCounts.x || id.y >= (uint)primaryCounts.y ||
+        surfaceSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+        return;
+
+    int2 coord = int2((int)id.x, (int)id.y);
+    int primaryArea = primaryCounts.x * primaryCounts.y;
+    int column = coord.x + coord.y * primaryCounts.x;
+    int outputIndex = surfaceSlot * primaryArea + column;
+    DoorwaySurfaceGapScanData output;
+    output.meta = float4(-1.0f, -1.0f, (float)surfaceSlot, 0.0f);
+    output.target = 0.0f;
+    output.ownCoverage = 0.0f;
+    output.currentNeighbours = 0.0f;
+    output.previousNeighbours = 0.0f;
+    output.topology = 0.0f;
+
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    int directLayer;
+    PrimaryVoxelCell directCell;
+    bool hasDirectSurface = TryFindPrimaryVoxelRenderSurface(
+        column, surfaceSlot, minimumFill, directLayer, directCell);
+    float targetHeight;
+    float rawTargetCoverage;
+    float2 targetFlow;
+    bool directColumnSupport;
+    bool enclosedInteriorSupport;
+    bool hasTarget = TryBuildFractionalPrimaryVoxelSurface(
+        (float2)coord, surfaceSlot,
+        targetHeight, rawTargetCoverage, targetFlow,
+        directColumnSupport, enclosedInteriorSupport);
+    if (!hasDirectSurface || !hasTarget || !directColumnSupport)
+    {
+        doorwaySurfaceGapScan[outputIndex] = output;
+        return;
+    }
+
+    float visibleContour = clamp(_SurfaceFieldVisibleContour, 0.05f, 0.9f);
+    float compatibilityBand = max(_PrimaryVoxelSurfaceCellHeight * 1.5f, 0.05f);
+    float ownCurrent;
+    float ownPrevious;
+    ReadDoorwayPreferredFootprintVisibleCoverage(
+        coord, surfaceSlot, targetHeight, compatibilityBand,
+        visibleContour, false, ownCurrent);
+    ReadDoorwayPreferredFootprintVisibleCoverage(
+        coord, surfaceSlot, targetHeight, compatibilityBand,
+        visibleContour, true, ownPrevious);
+    if (ownCurrent >= visibleContour)
+    {
+        doorwaySurfaceGapScan[outputIndex] = output;
+        return;
+    }
+
+    float4 currentNeighbours = 0.0f;
+    float4 previousNeighbours = 0.0f;
+    int wetMask = 0;
+    int currentVisibleMask = 0;
+    int previousVisibleMask = 0;
+    for (int direction = 0; direction < 4; direction++)
+    {
+        int2 offset = int2(0, 0);
+        if (direction == 0) offset = int2(1, 0);
+        else if (direction == 1) offset = int2(-1, 0);
+        else if (direction == 2) offset = int2(0, 1);
+        else offset = int2(0, -1);
+        int2 neighbour = coord + offset;
+        if (neighbour.x < 0 || neighbour.y < 0 ||
+            neighbour.x >= primaryCounts.x || neighbour.y >= primaryCounts.y)
+            continue;
+        int neighbourColumn = neighbour.x + neighbour.y * primaryCounts.x;
+        int neighbourLayer;
+        PrimaryVoxelCell neighbourCell;
+        if (!TryFindPrimaryVoxelRenderSurface(
+                neighbourColumn, surfaceSlot, minimumFill,
+                neighbourLayer, neighbourCell) || neighbourLayer != directLayer)
+            continue;
+        float neighbourHeight = _BoundsMin.y +
+            ((float)neighbourLayer + saturate(neighbourCell.fillAndFlags.x)) *
+                max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+        if (abs(neighbourHeight - targetHeight) > compatibilityBand)
+            continue;
+        wetMask |= 1 << direction;
+        float currentCoverage;
+        float previousCoverage;
+        ReadDoorwayPreferredFootprintVisibleCoverage(
+            neighbour, surfaceSlot, targetHeight, compatibilityBand,
+            visibleContour, false, currentCoverage);
+        ReadDoorwayPreferredFootprintVisibleCoverage(
+            neighbour, surfaceSlot, targetHeight, compatibilityBand,
+            visibleContour, true, previousCoverage);
+        if (direction == 0)
+        {
+            currentNeighbours.x = currentCoverage;
+            previousNeighbours.x = previousCoverage;
+        }
+        else if (direction == 1)
+        {
+            currentNeighbours.y = currentCoverage;
+            previousNeighbours.y = previousCoverage;
+        }
+        else if (direction == 2)
+        {
+            currentNeighbours.z = currentCoverage;
+            previousNeighbours.z = previousCoverage;
+        }
+        else
+        {
+            currentNeighbours.w = currentCoverage;
+            previousNeighbours.w = previousCoverage;
+        }
+        if (currentCoverage >= visibleContour) currentVisibleMask |= 1 << direction;
+        if (previousCoverage >= visibleContour) previousVisibleMask |= 1 << direction;
+    }
+
+    if ((currentVisibleMask | previousVisibleMask) == 0)
+    {
+        doorwaySurfaceGapScan[outputIndex] = output;
+        return;
+    }
+
+    bool bracketedX = (currentVisibleMask & 3) == 3;
+    bool bracketedZ = (currentVisibleMask & 12) == 12;
+    bool previouslyBracketed = (previousVisibleMask & 3) == 3 ||
+        (previousVisibleMask & 12) == 12;
+    uint flags = 1u;
+    if (bracketedX) flags |= 2u;
+    if (bracketedZ) flags |= 4u;
+    if (previouslyBracketed) flags |= 8u;
+    if (enclosedInteriorSupport) flags |= 16u;
+    if ((wetMask & 15) == 15) flags |= 32u;
+    if (ownPrevious >= visibleContour) flags |= 64u;
+
+    output.meta = float4(
+        (float)coord.x, (float)coord.y, (float)surfaceSlot,
+        saturate(directCell.fillAndFlags.x));
+    output.target = float4(
+        targetHeight, rawTargetCoverage, visibleContour, (float)directLayer);
+    output.ownCoverage = float4(
+        ownCurrent, ownPrevious, length(targetFlow), compatibilityBand);
+    output.currentNeighbours = currentNeighbours;
+    output.previousNeighbours = previousNeighbours;
+    output.topology = float4(
+        (float)flags, (float)wetMask,
+        (float)currentVisibleMask, (float)previousVisibleMask);
+    doorwaySurfaceGapScan[outputIndex] = output;
+}
+bool TryFindOpenWetDoorwayFaceLink(
+    int column, int neighbourColumn, int direction,
+    out int linkLayer, out float sourceFill, out float targetFill)
+{
+    linkLayer = -1;
+    sourceFill = 0.0f;
+    targetFill = 0.0f;
+    int layerCount = max(_PrimaryVoxelFlowLayerCount, 1);
+    int layersPerColumn = max(_BulkGridCountX, 1) * max(_BulkGridCountZ, 1);
+    uint sourceBit = direction == 0 ? 1u : 4u;
+    uint targetBit = direction == 0 ? 2u : 8u;
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    [loop]
+    for (int layer = layerCount - 1; layer >= 0; layer--)
+    {
+        int sourceIndex = column + layer * layersPerColumn;
+        int targetIndex = neighbourColumn + layer * layersPerColumn;
+        if ((primaryVoxelFaceOpenCells[sourceIndex] & sourceBit) == 0u ||
+            (primaryVoxelFaceOpenCells[targetIndex] & targetBit) == 0u)
+            continue;
+        float aFill = saturate(primaryVoxelFlowCells[sourceIndex].fillAndFlags.x);
+        float bFill = saturate(primaryVoxelFlowCells[targetIndex].fillAndFlags.x);
+        if (aFill < minimumFill || bFill < minimumFill)
+            continue;
+        linkLayer = layer;
+        sourceFill = aFill;
+        targetFill = bFill;
+        return true;
+    }
+    return false;
+}
+
+bool TryFindClosestDoorwaySurface(
+    int column, int linkLayer, float minimumFill,
+    out int resultSlot, out int resultLayer, out PrimaryVoxelCell resultCell)
+{
+    resultSlot = -1;
+    resultLayer = -1;
+    resultCell.velocityPressure = 0.0f;
+    resultCell.fillAndFlags = 0.0f;
+    int bestDistance = 65535;
+    [unroll]
+    for (int candidateSlot = 0; candidateSlot < 3; candidateSlot++)
+    {
+        if (candidateSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+            break;
+        int candidateLayer;
+        PrimaryVoxelCell candidateCell;
+        if (!TryFindPrimaryVoxelRenderSurface(
+                column, candidateSlot, minimumFill,
+                candidateLayer, candidateCell))
+            continue;
+        int distance = abs(candidateLayer - linkLayer);
+        if (resultSlot >= 0 && distance >= bestDistance)
+            continue;
+        resultSlot = candidateSlot;
+        resultLayer = candidateLayer;
+        resultCell = candidateCell;
+        bestDistance = distance;
+    }
+    return resultSlot >= 0;
+}
+
+float DoorwayFaceOutgoingFlux(PrimaryVoxelFaceFlux flux, int direction, bool reverse)
+{
+    if (direction == 0)
+        return reverse ? flux.lateral.y : flux.lateral.x;
+    return reverse ? flux.lateral.w : flux.lateral.z;
+}
+
+SurfaceFieldData EmptyDoorwaySurfaceField()
+{
+    SurfaceFieldData result;
+    result.height = _BoundsMin.y;
+    result.coverage = 0.0f;
+    result.flow = 0.0f;
+    result.thickness = 0.0f;
+    result.confidence = 0.0f;
+    result.pad = 0.0f;
+    return result;
+}
+
+[numthreads(8, 8, 1)]
+void CSScanDoorwaySurfaceFaces(uint3 id : SV_DispatchThreadID)
+{
+    int2 primaryCounts = int2(max(_BulkGridCountX, 1), max(_BulkGridCountZ, 1));
+    int faceSlot = (int)id.z;
+    int surfaceSlot = faceSlot / 2;
+    int direction = faceSlot % 2;
+    if (id.x >= (uint)primaryCounts.x || id.y >= (uint)primaryCounts.y ||
+        surfaceSlot >= max(_PrimaryVoxelSurfaceSlotCount, 1))
+        return;
+
+    int2 coord = int2((int)id.x, (int)id.y);
+    int2 offset = direction == 0 ? int2(1, 0) : int2(0, 1);
+    int primaryArea = primaryCounts.x * primaryCounts.y;
+    int column = coord.x + coord.y * primaryCounts.x;
+    int outputIndex = faceSlot * primaryArea + column;
+    DoorwaySurfaceFaceData output;
+    output.meta = float4((float)coord.x, (float)coord.y, (float)surfaceSlot, (float)direction);
+    output.sourceSurface = 0.0f;
+    output.targetSurface = 0.0f;
+    output.heights = 0.0f;
+    output.coverage = 0.0f;
+    output.flow = 0.0f;
+    output.state = 0.0f;
+    output.topology = 0.0f;
+    int2 neighbourCoord = coord + offset;
+    if (neighbourCoord.x >= primaryCounts.x || neighbourCoord.y >= primaryCounts.y)
+    {
+        doorwaySurfaceFaceScan[outputIndex] = output;
+        return;
+    }
+
+    int neighbourColumn = neighbourCoord.x + neighbourCoord.y * primaryCounts.x;
+    int linkLayer;
+    float linkSourceFill;
+    float linkTargetFill;
+    if (!TryFindOpenWetDoorwayFaceLink(
+            column, neighbourColumn, direction,
+            linkLayer, linkSourceFill, linkTargetFill))
+    {
+        doorwaySurfaceFaceScan[outputIndex] = output;
+        return;
+    }
+
+    float minimumFill = max(_PrimaryVoxelSurfaceMinimumFill, 0.00001f);
+    int sourceLayer;
+    PrimaryVoxelCell sourceCell;
+    bool hasSource = TryFindPrimaryVoxelRenderSurface(
+        column, surfaceSlot, minimumFill, sourceLayer, sourceCell);
+    int targetSlot;
+    int targetLayer;
+    PrimaryVoxelCell targetCell;
+    bool hasTarget = TryFindClosestDoorwaySurface(
+        neighbourColumn, linkLayer, minimumFill,
+        targetSlot, targetLayer, targetCell);
+    // The scan iterates source slots. An absent source or target surface is
+    // bookkeeping, not a broken doorway sheet, so exclude it from diagnostics.
+    if (!hasSource || !hasTarget)
+    {
+        doorwaySurfaceFaceScan[outputIndex] = output;
+        return;
+    }
+
+    float voxelHeight = max(_PrimaryVoxelSurfaceCellHeight, 0.0001f);
+    float sourceHeight = hasSource ? _BoundsMin.y +
+        ((float)sourceLayer + saturate(sourceCell.fillAndFlags.x)) * voxelHeight : _BoundsMin.y;
+    float targetHeight = hasTarget ? _BoundsMin.y +
+        ((float)targetLayer + saturate(targetCell.fillAndFlags.x)) * voxelHeight : _BoundsMin.y;
+    float compatibilityBand = max(voxelHeight * 1.5f, 0.05f);
+    bool sameLayer = hasSource && hasTarget && sourceLayer == targetLayer;
+    bool heightAccepted = hasSource && hasTarget &&
+        abs(sourceHeight - targetHeight) <= compatibilityBand;
+    float visibleContour = clamp(_SurfaceFieldVisibleContour, 0.05f, 0.9f);
+    SurfaceFieldData sourceNow = EmptyDoorwaySurfaceField();
+    SurfaceFieldData sourcePrevious = EmptyDoorwaySurfaceField();
+    SurfaceFieldData targetNow = EmptyDoorwaySurfaceField();
+    SurfaceFieldData targetPrevious = EmptyDoorwaySurfaceField();
+    if (hasSource)
+    {
+        sourceNow = ReadDoorwaySurfaceField(coord, surfaceSlot);
+        sourcePrevious = ReadDoorwayPreviousSurfaceField(coord, surfaceSlot);
+    }
+    if (hasTarget)
+    {
+        targetNow = ReadDoorwaySurfaceField(neighbourCoord, targetSlot);
+        targetPrevious = ReadDoorwayPreviousSurfaceField(neighbourCoord, targetSlot);
+    }
+    PrimaryVoxelFaceFlux sourceFlux = primaryVoxelFaceFluxCells[
+        column + linkLayer * primaryArea];
+    PrimaryVoxelFaceFlux targetFlux = primaryVoxelFaceFluxCells[
+        neighbourColumn + linkLayer * primaryArea];
+    float sourceOutgoing = DoorwayFaceOutgoingFlux(sourceFlux, direction, false);
+    float targetOutgoing = DoorwayFaceOutgoingFlux(targetFlux, direction, true);
+    uint flags = 1u;
+    if (hasSource) flags |= 2u;
+    if (hasTarget) flags |= 4u;
+    if (sameLayer) flags |= 8u;
+    if (heightAccepted) flags |= 16u;
+    if (hasSource && sourceNow.coverage >= visibleContour) flags |= 32u;
+    if (hasTarget && targetNow.coverage >= visibleContour) flags |= 64u;
+    if (hasSource && hasTarget && surfaceSlot != targetSlot) flags |= 128u;
+
+    output.sourceSurface = float4(
+        hasSource ? 1.0f : 0.0f, (float)sourceLayer,
+        sourceHeight, hasSource ? saturate(sourceCell.fillAndFlags.x) : 0.0f);
+    output.targetSurface = float4(
+        hasTarget ? 1.0f : 0.0f, (float)targetSlot,
+        (float)targetLayer, hasTarget ? saturate(targetCell.fillAndFlags.x) : 0.0f);
+    output.heights = float4(targetHeight, sourceHeight - targetHeight,
+        compatibilityBand, (float)linkLayer);
+    output.coverage = float4(saturate(sourceNow.coverage),
+        saturate(sourcePrevious.coverage), saturate(targetNow.coverage),
+        saturate(targetPrevious.coverage));
+    output.flow = float4(sourceOutgoing - targetOutgoing,
+        sourceOutgoing, targetOutgoing, min(linkSourceFill, linkTargetFill));
+    output.state = float4(linkSourceFill, linkTargetFill,
+        sameLayer ? 1.0f : 0.0f, heightAccepted ? 1.0f : 0.0f);
+    output.topology = float4((float)flags, visibleContour,
+        hasSource && sourceNow.coverage >= visibleContour ? 1.0f : 0.0f,
+        hasTarget && targetNow.coverage >= visibleContour ? 1.0f : 0.0f);
+    doorwaySurfaceFaceScan[outputIndex] = output;
+}
